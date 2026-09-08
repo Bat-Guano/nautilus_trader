@@ -776,6 +776,7 @@ pub fn parse_order_status_report(
         reduce_only: false,
         cancel_reason: order.reason.clone(),
         ts_triggered: None,
+        raw_order_status: None,
     })
 }
 
@@ -949,6 +950,7 @@ pub fn parse_futures_order_status_report(
         reduce_only: order.reduce_only.unwrap_or(false),
         cancel_reason: None,
         ts_triggered: None,
+        raw_order_status: None,
     })
 }
 
@@ -1030,6 +1032,7 @@ pub fn parse_futures_order_event_status_report(
         reduce_only: event.reduce_only,
         cancel_reason: None,
         ts_triggered: None,
+        raw_order_status: None,
     })
 }
 

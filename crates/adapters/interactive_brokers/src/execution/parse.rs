@@ -160,6 +160,11 @@ pub fn parse_order_status_to_report(
     instrument_provider: &InteractiveBrokersInstrumentProvider,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
+    // C2.6: capture the exact raw IBKR status string before any
+    // normalization. The patched ibapi `OrderStatusKind` preserves the
+    // wire value byte-for-byte for known and unknown vocabulary alike.
+    let raw_order_status = order_status.status.as_str().to_string();
+
     // Get price magnifier from instrument provider
     let price_magnifier = instrument_provider.get_price_magnifier(&instrument_id) as f64;
 
@@ -258,6 +263,10 @@ pub fn parse_order_status_to_report(
         ts_init,
         Some(nautilus_core::UUID4::new()), // report_id
     );
+
+    // Preserve the exact raw broker provenance alongside the normalized
+    // status; C2.4 adjudicates whether that provenance is trusted.
+    report = report.with_raw_order_status(raw_order_status);
 
     // Set optional fields
     if let Some(order) = order {
@@ -720,6 +729,81 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.avg_px, Some(Decimal::from_str("-2.25").unwrap()));
+    }
+
+    #[rstest]
+    fn test_parse_order_status_to_report_known_raw_status_preserved() {
+        let instrument_provider = create_test_instrument_provider();
+        let instrument_id = create_test_instrument_id();
+        let account_id = AccountId::from("IB-001");
+
+        let order_status = OrderStatus {
+            order_id: 12345,
+            status: OrderStatusKind::PendingSubmit,
+            filled: 0.0,
+            remaining: 100.0,
+            average_fill_price: Some(0.0),
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: Some(0.0),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+
+        let report = parse_order_status_to_report(
+            &order_status,
+            None,
+            instrument_id,
+            account_id,
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        // A4: recognized raw vocabulary reaches the report byte-exact.
+        assert_eq!(report.raw_order_status.as_deref(), Some("PendingSubmit"));
+        assert_eq!(report.order_status, NautilusOrderStatus::Submitted);
+    }
+
+    #[rstest]
+    fn test_parse_order_status_to_report_unknown_raw_status_preserved() {
+        let instrument_provider = create_test_instrument_provider();
+        let instrument_id = create_test_instrument_id();
+        let account_id = AccountId::from("IB-001");
+
+        let order_status = OrderStatus {
+            order_id: 12345,
+            status: OrderStatusKind::Unknown("SomeFutureIbkrStatus".into()),
+            filled: 0.0,
+            remaining: 100.0,
+            average_fill_price: Some(0.0),
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: Some(0.0),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+
+        let report = parse_order_status_to_report(
+            &order_status,
+            None,
+            instrument_id,
+            account_id,
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        // A5/A6: the unknown raw value reaches the report byte-exact while
+        // the normalized status conservatively remains SUBMITTED - the
+        // fallback does not erase provenance.
+        assert_eq!(
+            report.raw_order_status.as_deref(),
+            Some("SomeFutureIbkrStatus"),
+        );
+        assert_eq!(report.order_status, NautilusOrderStatus::Submitted);
     }
 
     #[rstest]

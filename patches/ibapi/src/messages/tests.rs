@@ -1,0 +1,1549 @@
+use prost::Message;
+
+use super::*;
+
+// Table-driven test data structures
+struct EncodeLengthTestCase {
+    message: &'static str,
+    expected_length: usize,
+}
+
+struct ResponseMessageParseTestCase {
+    name: &'static str,
+    input: &'static str,
+    field_index: usize,
+    parse_type: ParseType,
+    expected: ParseResult,
+}
+
+enum ParseType {
+    Int,
+    Double,
+    String,
+}
+
+enum ParseResult {
+    Int(i32),
+    Double(f64),
+    String(String),
+    Error,
+}
+
+// Test data that can be shared between sync and async tests
+fn encode_length_test_cases() -> Vec<EncodeLengthTestCase> {
+    vec![
+        EncodeLengthTestCase {
+            message: "hello",
+            expected_length: 9, // 4 bytes for length + 5 bytes for "hello"
+        },
+        EncodeLengthTestCase {
+            message: "",
+            expected_length: 4, // 4 bytes for length + 0 bytes for empty string
+        },
+        EncodeLengthTestCase {
+            message: "a\0b\0c",
+            expected_length: 9, // 4 bytes for length + 5 bytes for "a\0b\0c"
+        },
+    ]
+}
+
+fn response_message_parse_test_cases() -> Vec<ResponseMessageParseTestCase> {
+    vec![
+        ResponseMessageParseTestCase {
+            name: "parse_valid_int",
+            input: "1\0123\0456\0",
+            field_index: 1,
+            parse_type: ParseType::Int,
+            expected: ParseResult::Int(123),
+        },
+        ResponseMessageParseTestCase {
+            name: "parse_invalid_int",
+            input: "1\0abc\0456\0",
+            field_index: 1,
+            parse_type: ParseType::Int,
+            expected: ParseResult::Error,
+        },
+        ResponseMessageParseTestCase {
+            name: "parse_double",
+            input: "1\03.14567\0456\0",
+            field_index: 1,
+            parse_type: ParseType::Double,
+            expected: ParseResult::Double(3.14567),
+        },
+        ResponseMessageParseTestCase {
+            name: "parse_double_zero",
+            input: "1\00\0456\0",
+            field_index: 1,
+            parse_type: ParseType::Double,
+            expected: ParseResult::Double(0.0),
+        },
+        ResponseMessageParseTestCase {
+            name: "parse_string",
+            input: "1\0hello world\0456\0",
+            field_index: 1,
+            parse_type: ParseType::String,
+            expected: ParseResult::String("hello world".to_string()),
+        },
+    ]
+}
+
+#[test]
+fn test_incoming_message_from_i32() {
+    assert_eq!(IncomingMessages::from(1), IncomingMessages::TickPrice);
+    assert_eq!(IncomingMessages::from(2), IncomingMessages::TickSize);
+    assert_eq!(IncomingMessages::from(3), IncomingMessages::OrderStatus);
+    assert_eq!(IncomingMessages::from(4), IncomingMessages::Error);
+    assert_eq!(IncomingMessages::from(5), IncomingMessages::OpenOrder);
+    assert_eq!(IncomingMessages::from(6), IncomingMessages::AccountValue);
+    assert_eq!(IncomingMessages::from(7), IncomingMessages::PortfolioValue);
+    assert_eq!(IncomingMessages::from(8), IncomingMessages::AccountUpdateTime);
+    assert_eq!(IncomingMessages::from(9), IncomingMessages::NextValidId);
+    assert_eq!(IncomingMessages::from(10), IncomingMessages::ContractData);
+    assert_eq!(IncomingMessages::from(11), IncomingMessages::ExecutionData);
+    assert_eq!(IncomingMessages::from(12), IncomingMessages::MarketDepth);
+    assert_eq!(IncomingMessages::from(13), IncomingMessages::MarketDepthL2);
+    assert_eq!(IncomingMessages::from(14), IncomingMessages::NewsBulletins);
+    assert_eq!(IncomingMessages::from(15), IncomingMessages::ManagedAccounts);
+    assert_eq!(IncomingMessages::from(16), IncomingMessages::ReceiveFA);
+    assert_eq!(IncomingMessages::from(17), IncomingMessages::HistoricalData);
+    assert_eq!(IncomingMessages::from(18), IncomingMessages::BondContractData);
+    assert_eq!(IncomingMessages::from(19), IncomingMessages::ScannerParameters);
+    assert_eq!(IncomingMessages::from(20), IncomingMessages::ScannerData);
+    assert_eq!(IncomingMessages::from(21), IncomingMessages::TickOptionComputation);
+    assert_eq!(IncomingMessages::from(45), IncomingMessages::TickGeneric);
+    assert_eq!(IncomingMessages::from(46), IncomingMessages::TickString);
+    assert_eq!(IncomingMessages::from(47), IncomingMessages::TickEFP);
+    assert_eq!(IncomingMessages::from(49), IncomingMessages::CurrentTime);
+    assert_eq!(IncomingMessages::from(50), IncomingMessages::RealTimeBars);
+    assert_eq!(IncomingMessages::from(51), IncomingMessages::FundamentalData);
+    assert_eq!(IncomingMessages::from(52), IncomingMessages::ContractDataEnd);
+    assert_eq!(IncomingMessages::from(53), IncomingMessages::OpenOrderEnd);
+    assert_eq!(IncomingMessages::from(54), IncomingMessages::AccountDownloadEnd);
+    assert_eq!(IncomingMessages::from(55), IncomingMessages::ExecutionDataEnd);
+    assert_eq!(IncomingMessages::from(56), IncomingMessages::DeltaNeutralValidation);
+    assert_eq!(IncomingMessages::from(57), IncomingMessages::TickSnapshotEnd);
+    assert_eq!(IncomingMessages::from(58), IncomingMessages::MarketDataType);
+    assert_eq!(IncomingMessages::from(59), IncomingMessages::CommissionsReport);
+    assert_eq!(IncomingMessages::from(61), IncomingMessages::Position);
+    assert_eq!(IncomingMessages::from(62), IncomingMessages::PositionEnd);
+    assert_eq!(IncomingMessages::from(63), IncomingMessages::AccountSummary);
+    assert_eq!(IncomingMessages::from(64), IncomingMessages::AccountSummaryEnd);
+    assert_eq!(IncomingMessages::from(65), IncomingMessages::VerifyMessageApi);
+    assert_eq!(IncomingMessages::from(66), IncomingMessages::VerifyCompleted);
+    assert_eq!(IncomingMessages::from(67), IncomingMessages::DisplayGroupList);
+    assert_eq!(IncomingMessages::from(68), IncomingMessages::DisplayGroupUpdated);
+    assert_eq!(IncomingMessages::from(69), IncomingMessages::VerifyAndAuthMessageApi);
+    assert_eq!(IncomingMessages::from(70), IncomingMessages::VerifyAndAuthCompleted);
+    assert_eq!(IncomingMessages::from(71), IncomingMessages::PositionMulti);
+    assert_eq!(IncomingMessages::from(72), IncomingMessages::PositionMultiEnd);
+    assert_eq!(IncomingMessages::from(73), IncomingMessages::AccountUpdateMulti);
+    assert_eq!(IncomingMessages::from(74), IncomingMessages::AccountUpdateMultiEnd);
+    assert_eq!(IncomingMessages::from(75), IncomingMessages::SecurityDefinitionOptionParameter);
+    assert_eq!(IncomingMessages::from(76), IncomingMessages::SecurityDefinitionOptionParameterEnd);
+    assert_eq!(IncomingMessages::from(77), IncomingMessages::SoftDollarTier);
+    assert_eq!(IncomingMessages::from(78), IncomingMessages::FamilyCodes);
+    assert_eq!(IncomingMessages::from(79), IncomingMessages::SymbolSamples);
+    assert_eq!(IncomingMessages::from(80), IncomingMessages::MktDepthExchanges);
+    assert_eq!(IncomingMessages::from(81), IncomingMessages::TickReqParams);
+    assert_eq!(IncomingMessages::from(82), IncomingMessages::SmartComponents);
+    assert_eq!(IncomingMessages::from(83), IncomingMessages::NewsArticle);
+    assert_eq!(IncomingMessages::from(84), IncomingMessages::TickNews);
+    assert_eq!(IncomingMessages::from(85), IncomingMessages::NewsProviders);
+    assert_eq!(IncomingMessages::from(86), IncomingMessages::HistoricalNews);
+    assert_eq!(IncomingMessages::from(87), IncomingMessages::HistoricalNewsEnd);
+    assert_eq!(IncomingMessages::from(88), IncomingMessages::HeadTimestamp);
+    assert_eq!(IncomingMessages::from(89), IncomingMessages::HistogramData);
+    assert_eq!(IncomingMessages::from(90), IncomingMessages::HistoricalDataUpdate);
+    assert_eq!(IncomingMessages::from(91), IncomingMessages::RerouteMktDataReq);
+    assert_eq!(IncomingMessages::from(92), IncomingMessages::RerouteMktDepthReq);
+    assert_eq!(IncomingMessages::from(93), IncomingMessages::MarketRule);
+    assert_eq!(IncomingMessages::from(94), IncomingMessages::PnL);
+    assert_eq!(IncomingMessages::from(95), IncomingMessages::PnLSingle);
+    assert_eq!(IncomingMessages::from(96), IncomingMessages::HistoricalTick);
+    assert_eq!(IncomingMessages::from(97), IncomingMessages::HistoricalTickBidAsk);
+    assert_eq!(IncomingMessages::from(98), IncomingMessages::HistoricalTickLast);
+    assert_eq!(IncomingMessages::from(99), IncomingMessages::TickByTick);
+    assert_eq!(IncomingMessages::from(100), IncomingMessages::OrderBound);
+    assert_eq!(IncomingMessages::from(101), IncomingMessages::CompletedOrder);
+    assert_eq!(IncomingMessages::from(102), IncomingMessages::CompletedOrdersEnd);
+    assert_eq!(IncomingMessages::from(103), IncomingMessages::ReplaceFAEnd);
+    assert_eq!(IncomingMessages::from(104), IncomingMessages::WshMetaData);
+    assert_eq!(IncomingMessages::from(105), IncomingMessages::WshEventData);
+    assert_eq!(IncomingMessages::from(106), IncomingMessages::HistoricalSchedule);
+    assert_eq!(IncomingMessages::from(107), IncomingMessages::UserInfo);
+    assert_eq!(IncomingMessages::from(108), IncomingMessages::HistoricalDataEnd);
+    assert_eq!(IncomingMessages::from(109), IncomingMessages::CurrentTimeInMillis);
+    assert_eq!(IncomingMessages::from(110), IncomingMessages::ConfigResponse);
+    assert_eq!(IncomingMessages::from(111), IncomingMessages::UpdateConfigResponse);
+    assert_eq!(IncomingMessages::from(112), IncomingMessages::NotValid);
+}
+
+#[test]
+fn test_routes_by_request_id() {
+    // Sample of the allow-list — full registration check happens via
+    // request_id() round-trips, not exhaustive enumeration here.
+    assert!(routes_by_request_id(IncomingMessages::ContractData));
+    assert!(routes_by_request_id(IncomingMessages::TickByTick));
+    assert!(routes_by_request_id(IncomingMessages::SymbolSamples));
+    assert!(routes_by_request_id(IncomingMessages::ExecutionData));
+    assert!(routes_by_request_id(IncomingMessages::HeadTimestamp));
+    assert!(routes_by_request_id(IncomingMessages::HistoricalData));
+    assert!(routes_by_request_id(IncomingMessages::HistoricalSchedule));
+    assert!(routes_by_request_id(IncomingMessages::ContractDataEnd));
+    assert!(routes_by_request_id(IncomingMessages::RealTimeBars));
+    assert!(routes_by_request_id(IncomingMessages::ExecutionDataEnd));
+
+    // Error has its own envelope; shared messages route by message type.
+    assert!(!routes_by_request_id(IncomingMessages::Error));
+    // FundamentalData is retained as a known variant but no longer routes:
+    // the fundamental-data feature was removed in TWS 10.47.
+    assert!(!routes_by_request_id(IncomingMessages::FundamentalData));
+    assert!(!routes_by_request_id(IncomingMessages::ManagedAccounts));
+    assert!(!routes_by_request_id(IncomingMessages::NextValidId));
+    assert!(!routes_by_request_id(IncomingMessages::CurrentTime));
+    assert!(!routes_by_request_id(IncomingMessages::NotValid));
+}
+
+#[test]
+fn test_text_request_id_field() {
+    // Field-1 messages (request_id immediately after message-type tag).
+    assert_eq!(text_request_id_field(IncomingMessages::ContractData), Some(1));
+    assert_eq!(text_request_id_field(IncomingMessages::TickByTick), Some(1));
+
+    // Field-2 messages (request_id after a version field).
+    assert_eq!(text_request_id_field(IncomingMessages::TickPrice), Some(2));
+    assert_eq!(text_request_id_field(IncomingMessages::ContractDataEnd), Some(2));
+
+    // Shared and unrouted messages get None.
+    assert_eq!(text_request_id_field(IncomingMessages::ManagedAccounts), None);
+    assert_eq!(text_request_id_field(IncomingMessages::Error), None);
+    assert_eq!(text_request_id_field(IncomingMessages::NotValid), None);
+    // FundamentalData no longer routes (feature removed in TWS 10.47).
+    assert_eq!(text_request_id_field(IncomingMessages::FundamentalData), None);
+}
+
+#[test]
+fn test_notice() {
+    let message = crate::common::test_utils::helpers::proto_error_response(-1, 2107, "HMDS data farm connection is inactive.");
+
+    let notice = Notice::from(&message);
+
+    assert_eq!(notice.code, 2107);
+    assert_eq!(notice.message, "HMDS data farm connection is inactive.");
+    assert_eq!(format!("{notice}"), "[2107] HMDS data farm connection is inactive.");
+}
+
+#[test]
+fn test_encode_length() {
+    for test_case in encode_length_test_cases() {
+        let encoded = encode_length(test_case.message);
+        assert_eq!(encoded.len(), test_case.expected_length, "Failed for message: {:?}", test_case.message);
+
+        // Verify the length bytes are correct
+        let length_bytes = &encoded[0..4];
+        let length = u32::from_be_bytes([length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3]]);
+        assert_eq!(
+            length as usize,
+            test_case.message.len(),
+            "Incorrect length encoding for message: {:?}",
+            test_case.message
+        );
+    }
+}
+
+#[test]
+fn test_response_message_parsing() {
+    for test_case in response_message_parse_test_cases() {
+        let mut message = ResponseMessage::from(test_case.input);
+        message.i = test_case.field_index;
+
+        match (&test_case.parse_type, &test_case.expected) {
+            (ParseType::Int, ParseResult::Int(expected)) => match message.next_int() {
+                Ok(val) => assert_eq!(val, *expected, "Test '{}' failed", test_case.name),
+                Err(e) => panic!("Test '{}' failed: expected {:?}, got error: {:?}", test_case.name, expected, e),
+            },
+            (ParseType::Int, ParseResult::Error) => {
+                assert!(message.next_int().is_err(), "Test '{}' failed: expected error", test_case.name);
+            }
+            (ParseType::Double, ParseResult::Double(expected)) => match message.next_double() {
+                Ok(val) => assert!(
+                    (val - expected).abs() < f64::EPSILON,
+                    "Test '{}' failed: expected {:?}, got {:?}",
+                    test_case.name,
+                    expected,
+                    val
+                ),
+                Err(e) => panic!("Test '{}' failed: expected {:?}, got error: {:?}", test_case.name, expected, e),
+            },
+            (ParseType::String, ParseResult::String(expected)) => match message.next_string() {
+                Ok(val) => assert_eq!(val, *expected, "Test '{}' failed", test_case.name),
+                Err(e) => panic!("Test '{}' failed: expected {:?}, got error: {:?}", test_case.name, expected, e),
+            },
+            _ => panic!("Test case type mismatch"),
+        }
+    }
+}
+
+#[test]
+fn test_response_message_boundary_conditions() {
+    // Test reading past end of message
+    let mut message = ResponseMessage::from("1\02\0");
+    message.i = 3; // Beyond the last field
+
+    assert!(message.next_int().is_err());
+    assert!(message.next_double().is_err());
+    assert!(message.next_string().is_err());
+}
+
+#[test]
+fn test_response_message_peek_operations() {
+    let message = ResponseMessage::from("1\0123\0abc\0456\0");
+
+    // Test peek_int
+    assert_eq!(message.peek_int(1).unwrap(), 123);
+    assert_eq!(message.peek_int(3).unwrap(), 456);
+    assert!(message.peek_int(2).is_err()); // "abc" is not an int
+    assert!(message.peek_int(4).is_err()); // Out of bounds (only 4 fields, indices 0-3)
+}
+
+#[test]
+fn peek_int_rejects_proto_framed_message() {
+    // CLAUDE.md rule 17: text-index accessors must be proto-aware. peek_int
+    // defensively returns Err(UnexpectedResponse) on a proto-framed message
+    // even if the caller passes a valid text-field index — production callers
+    // already gate on raw_bytes().is_none() before invoking, so the guard is
+    // unreachable in correct paths but catches misuse.
+    let proto_msg = ResponseMessage::from_protobuf(5, vec![0x08, 0x7B]);
+    assert!(matches!(proto_msg.peek_int(0), Err(crate::Error::UnexpectedResponse(_))));
+    assert!(matches!(proto_msg.peek_int(1), Err(crate::Error::UnexpectedResponse(_))));
+}
+
+#[test]
+fn test_text_framed_message_has_no_order_id_or_execution_id() {
+    // order_id() and execution_id() require proto-framed payloads; a
+    // text-framed message (raw_bytes = None) returns None regardless of the
+    // historical text-layout field positions.
+    let open_order = ResponseMessage::from("5\0123\0field2\0field3\0");
+    assert_eq!(open_order.order_id(), None);
+    assert_eq!(open_order.execution_id(), None);
+
+    let commission_message = ResponseMessage::from("59\0field1\0exec123\0");
+    assert_eq!(commission_message.execution_id(), None);
+}
+
+#[test]
+fn test_execution_id_protobuf_commissions_report() {
+    let bytes = crate::proto::CommissionAndFeesReport {
+        exec_id: Some("exec-proto-1".into()),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::CommissionsReport as i32, bytes);
+    assert_eq!(message.execution_id(), Some("exec-proto-1".to_string()));
+}
+
+#[test]
+fn test_execution_id_protobuf_execution_data() {
+    let bytes = crate::proto::ExecutionDetails {
+        req_id: Some(7),
+        contract: None,
+        execution: Some(crate::proto::Execution {
+            exec_id: Some("exec-proto-2".into()),
+            ..Default::default()
+        }),
+    }
+    .encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::ExecutionData as i32, bytes);
+    assert_eq!(message.execution_id(), Some("exec-proto-2".to_string()));
+}
+
+#[test]
+fn test_execution_id_protobuf_unknown_message_type_returns_none() {
+    let message = ResponseMessage::from_protobuf(IncomingMessages::OpenOrder as i32, Vec::new());
+    assert_eq!(message.execution_id(), None);
+}
+
+#[test]
+fn test_order_id_protobuf_open_order() {
+    let bytes = crate::proto::OpenOrder {
+        order_id: Some(42),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::OpenOrder as i32, bytes);
+    assert_eq!(message.order_id(), Some(42));
+}
+
+#[test]
+fn test_order_id_protobuf_order_status() {
+    let bytes = crate::proto::OrderStatus {
+        order_id: Some(99),
+        status: Some("Filled".into()),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::OrderStatus as i32, bytes);
+    assert_eq!(message.order_id(), Some(99));
+}
+
+#[test]
+fn test_order_id_protobuf_execution_data_nested() {
+    // ExecutionData carries order_id nested under `execution.order_id`,
+    // not at proto tag 1 (which is req_id).
+    let bytes = crate::proto::ExecutionDetails {
+        req_id: Some(7),
+        contract: None,
+        execution: Some(crate::proto::Execution {
+            order_id: Some(123),
+            ..Default::default()
+        }),
+    }
+    .encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::ExecutionData as i32, bytes);
+    assert_eq!(message.order_id(), Some(123));
+    assert_eq!(message.request_id(), Some(7));
+}
+
+#[test]
+fn test_order_id_protobuf_execution_data_end() {
+    // ExecutionDetailsEnd carries `req_id` at proto tag 1; order_id() returns
+    // that value because routing keys this message family by order_id and the
+    // proto schema overloads the field.
+    let bytes = crate::proto::ExecutionDetailsEnd { req_id: Some(55) }.encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::ExecutionDataEnd as i32, bytes);
+    assert_eq!(message.order_id(), Some(55));
+}
+
+#[test]
+fn test_request_id_protobuf_tag1() {
+    // HistoricalDataEnd-shaped envelope: just req_id at tag 1.
+    let bytes = ProtoIdEnvelope { id: Some(314) }.encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::HistoricalDataEnd as i32, bytes);
+    assert_eq!(message.request_id(), Some(314));
+}
+
+#[test]
+fn test_request_id_protobuf_message_type_without_request_id_returns_none() {
+    // ManagedAccounts is a shared message — not in routes_by_request_id, so
+    // request_id() returns None even if the proto payload carried an int @ tag 1.
+    let bytes = ProtoIdEnvelope { id: Some(42) }.encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::ManagedAccounts as i32, bytes);
+    assert_eq!(message.request_id(), None);
+}
+
+#[test]
+fn test_request_message_index() {
+    let message = RequestMessage {
+        fields: vec!["field0".to_string(), "field1".to_string(), "field2".to_string()],
+    };
+
+    assert_eq!(message[0], "field0");
+    assert_eq!(message[1], "field1");
+    assert_eq!(message[2], "field2");
+}
+
+#[test]
+#[should_panic]
+fn test_request_message_index_out_of_bounds() {
+    let message = RequestMessage {
+        fields: vec!["field0".to_string()],
+    };
+
+    let _ = &message[1]; // Should panic
+}
+
+#[test]
+fn test_response_message_is_shutdown() {
+    let shutdown_message = ResponseMessage::from("-2\0");
+    assert!(shutdown_message.is_shutdown());
+
+    let normal_message = ResponseMessage::from("1\0");
+    assert!(!normal_message.is_shutdown());
+}
+
+#[test]
+fn test_response_message_encode_decode_roundtrip() {
+    let original = ResponseMessage::from("1\0test\0123\03.456\0");
+    let encoded = original.encode();
+    let decoded = ResponseMessage::from(&encoded);
+
+    assert_eq!(original.fields, decoded.fields);
+}
+
+// Table-driven tests for parser_registry module
+#[test]
+fn test_field_based_parser() {
+    use super::parser_registry::{FieldBasedParser, FieldDef, MessageParser};
+
+    struct TestCase {
+        name: &'static str,
+        fields: Vec<FieldDef>,
+        input: Vec<&'static str>,
+        expected_count: usize,
+        expected_values: Vec<(&'static str, &'static str)>,
+    }
+
+    let test_cases = vec![
+        TestCase {
+            name: "basic_parsing",
+            fields: vec![
+                FieldDef::new(0, "message_type"),
+                FieldDef::new(1, "version"),
+                FieldDef::new(2, "request_id"),
+            ],
+            input: vec!["49", "1", "12345"],
+            expected_count: 3,
+            expected_values: vec![("message_type", "49"), ("version", "1"), ("request_id", "12345")],
+        },
+        TestCase {
+            name: "missing_fields",
+            fields: vec![FieldDef::new(0, "field1"), FieldDef::new(1, "field2"), FieldDef::new(5, "field6")],
+            input: vec!["val1", "val2"],
+            expected_count: 2,
+            expected_values: vec![("field1", "val1"), ("field2", "val2")],
+        },
+        TestCase {
+            name: "empty_input",
+            fields: vec![FieldDef::new(0, "field1")],
+            input: vec![],
+            expected_count: 0,
+            expected_values: vec![],
+        },
+        TestCase {
+            name: "with_transform",
+            fields: vec![FieldDef::new(0, "upper").with_transform(|s| s.to_uppercase())],
+            input: vec!["hello"],
+            expected_count: 1,
+            expected_values: vec![("upper", "HELLO")],
+        },
+    ];
+
+    for test_case in test_cases {
+        let parser = FieldBasedParser::new(test_case.fields);
+        let result = parser.parse(&test_case.input);
+
+        assert_eq!(
+            result.len(),
+            test_case.expected_count,
+            "Test '{}' failed: wrong field count",
+            test_case.name
+        );
+
+        for (field, (expected_name, expected_value)) in result.iter().zip(test_case.expected_values.iter()) {
+            assert_eq!(field.name, *expected_name, "Test '{}' failed: wrong field name", test_case.name);
+            assert_eq!(field.value, *expected_value, "Test '{}' failed: wrong field value", test_case.name);
+        }
+    }
+}
+
+#[test]
+fn test_timestamp_parser() {
+    use super::parser_registry::{FieldBasedParser, FieldDef, MessageParser, TimestampParser};
+
+    struct TestCase {
+        name: &'static str,
+        base_fields: Vec<FieldDef>,
+        timestamp_index: usize,
+        input: Vec<&'static str>,
+        expect_parsed_timestamp: bool,
+    }
+
+    let test_cases = vec![
+        TestCase {
+            name: "valid_timestamp",
+            base_fields: vec![FieldDef::new(0, "message_type"), FieldDef::new(1, "timestamp")],
+            timestamp_index: 1,
+            input: vec!["49", "1609459200"], // 2021-01-01 00:00:00 UTC
+            expect_parsed_timestamp: true,
+        },
+        TestCase {
+            name: "invalid_timestamp",
+            base_fields: vec![FieldDef::new(0, "message_type"), FieldDef::new(1, "timestamp")],
+            timestamp_index: 1,
+            input: vec!["49", "not_a_timestamp"],
+            expect_parsed_timestamp: false,
+        },
+        TestCase {
+            name: "missing_timestamp_field",
+            base_fields: vec![FieldDef::new(0, "message_type")],
+            timestamp_index: 3,
+            input: vec!["49"],
+            expect_parsed_timestamp: false,
+        },
+    ];
+
+    for test_case in test_cases {
+        let base_parser = FieldBasedParser::new(test_case.base_fields);
+        let parser = TimestampParser::new(base_parser, test_case.timestamp_index);
+        let result = parser.parse(&test_case.input);
+
+        let has_parsed_timestamp = result.iter().any(|f| f.name == "timestamp_parsed");
+        assert_eq!(
+            has_parsed_timestamp, test_case.expect_parsed_timestamp,
+            "Test '{}' failed: timestamp parsing expectation mismatch",
+            test_case.name
+        );
+    }
+}
+
+#[test]
+fn test_message_parser_registry() {
+    use super::parser_registry::MessageParserRegistry;
+
+    struct TestCase {
+        name: &'static str,
+        msg_type: OutgoingMessages,
+        input: Vec<&'static str>,
+        expected_fields: Vec<(&'static str, &'static str)>,
+    }
+
+    let test_cases = vec![
+        TestCase {
+            name: "request_current_time",
+            msg_type: OutgoingMessages::RequestCurrentTime,
+            input: vec!["49", "1"],
+            expected_fields: vec![("message_type", "49"), ("version", "1")],
+        },
+        TestCase {
+            name: "request_account_summary",
+            msg_type: OutgoingMessages::RequestAccountSummary,
+            input: vec!["62", "1", "123", "All", "NetLiquidation"],
+            expected_fields: vec![
+                ("message_type", "62"),
+                ("version", "1"),
+                ("request_id", "123"),
+                ("group", "All"),
+                ("tags", "NetLiquidation"),
+            ],
+        },
+        TestCase {
+            name: "request_pnl",
+            msg_type: OutgoingMessages::RequestPnL,
+            input: vec!["92", "456", "DU12345", ""],
+            expected_fields: vec![("message_type", "92"), ("request_id", "456"), ("account", "DU12345"), ("model_code", "")],
+        },
+    ];
+
+    let registry = MessageParserRegistry::new();
+
+    for test_case in test_cases {
+        let result = registry.parse_request(test_case.msg_type, &test_case.input);
+
+        assert_eq!(
+            result.len(),
+            test_case.expected_fields.len(),
+            "Test '{}' failed: wrong field count",
+            test_case.name
+        );
+
+        for (field, (expected_name, expected_value)) in result.iter().zip(test_case.expected_fields.iter()) {
+            assert_eq!(field.name, *expected_name, "Test '{}' failed: wrong field name", test_case.name);
+            assert_eq!(field.value, *expected_value, "Test '{}' failed: wrong field value", test_case.name);
+        }
+    }
+}
+
+#[test]
+fn test_response_parser_registry() {
+    use super::parser_registry::MessageParserRegistry;
+
+    struct TestCase {
+        name: &'static str,
+        msg_type: IncomingMessages,
+        input: Vec<&'static str>,
+        min_expected_fields: usize,
+    }
+
+    let test_cases = vec![
+        TestCase {
+            name: "error_message",
+            msg_type: IncomingMessages::Error,
+            input: vec!["4", "2", "-1", "2107", "HMDS data farm connection is inactive."],
+            min_expected_fields: 5,
+        },
+        TestCase {
+            name: "managed_accounts",
+            msg_type: IncomingMessages::ManagedAccounts,
+            input: vec!["15", "1", "DU12345,DU67890"],
+            min_expected_fields: 3,
+        },
+        TestCase {
+            name: "position",
+            msg_type: IncomingMessages::Position,
+            input: vec![
+                "61", "3", "DU12345", "12345", "AAPL", "STK", "", "0", "", "", "NASDAQ", "USD", "AAPL", "NMS", "100", "150.50",
+            ],
+            min_expected_fields: 16,
+        },
+        TestCase {
+            name: "pnl_single",
+            msg_type: IncomingMessages::PnLSingle,
+            input: vec!["95", "123", "100", "50.25", "75.50", "125.75", "10000"],
+            min_expected_fields: 7,
+        },
+    ];
+
+    let registry = MessageParserRegistry::new();
+
+    for test_case in test_cases {
+        let result = registry.parse_response(test_case.msg_type, &test_case.input);
+
+        assert!(
+            result.len() >= test_case.min_expected_fields,
+            "Test '{}' failed: expected at least {} fields, got {}",
+            test_case.name,
+            test_case.min_expected_fields,
+            result.len()
+        );
+    }
+}
+
+#[test]
+fn test_parse_generic_message() {
+    use super::parser_registry::parse_generic_message;
+
+    struct TestCase {
+        name: &'static str,
+        input: Vec<&'static str>,
+        expected_fields: Vec<(&'static str, &'static str)>,
+    }
+
+    let test_cases = vec![
+        TestCase {
+            name: "simple_message",
+            input: vec!["100", "field1", "field2", "field3"],
+            expected_fields: vec![
+                ("message_type", "100"),
+                ("field_2", "field1"),
+                ("field_3", "field2"),
+                ("field_4", "field3"),
+            ],
+        },
+        TestCase {
+            name: "message_with_trailing_empty",
+            input: vec!["200", "value", ""],
+            expected_fields: vec![("message_type", "200"), ("field_2", "value")],
+        },
+        TestCase {
+            name: "single_field",
+            input: vec!["300"],
+            expected_fields: vec![("message_type", "300")],
+        },
+    ];
+
+    for test_case in test_cases {
+        let result = parse_generic_message(&test_case.input);
+
+        assert_eq!(
+            result.len(),
+            test_case.expected_fields.len(),
+            "Test '{}' failed: wrong field count",
+            test_case.name
+        );
+
+        for (field, (expected_name, expected_value)) in result.iter().zip(test_case.expected_fields.iter()) {
+            assert_eq!(field.name, *expected_name, "Test '{}' failed: wrong field name", test_case.name);
+            assert_eq!(field.value, *expected_value, "Test '{}' failed: wrong field value", test_case.name);
+        }
+    }
+}
+
+#[test]
+fn test_custom_parser_registration() {
+    use super::parser_registry::{MessageParser, MessageParserRegistry};
+
+    struct CustomParser;
+    impl MessageParser for CustomParser {
+        fn parse(&self, _parts: &[&str]) -> Vec<super::parser_registry::ParsedField> {
+            vec![super::parser_registry::ParsedField {
+                name: "custom".to_string(),
+                value: "parser".to_string(),
+            }]
+        }
+    }
+
+    let mut registry = MessageParserRegistry::new();
+
+    // Register custom parsers
+    registry.register_request_parser(OutgoingMessages::RequestGlobalCancel, Box::new(CustomParser));
+    registry.register_response_parser(IncomingMessages::NewsArticle, Box::new(CustomParser));
+
+    // Test custom request parser
+    let result = registry.parse_request(OutgoingMessages::RequestGlobalCancel, &["58"]);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "custom");
+    assert_eq!(result[0].value, "parser");
+
+    // Test custom response parser
+    let result = registry.parse_response(IncomingMessages::NewsArticle, &["83"]);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "custom");
+    assert_eq!(result[0].value, "parser");
+}
+
+// Tests for error conditions and edge cases
+#[test]
+fn test_response_message_next_methods_edge_cases() {
+    struct TestCase {
+        name: &'static str,
+        input: &'static str,
+        test_fn: fn(&mut ResponseMessage) -> bool,
+    }
+
+    let test_cases = vec![
+        TestCase {
+            name: "empty_message",
+            input: "",
+            test_fn: |msg| msg.next_int().is_err(),
+        },
+        TestCase {
+            name: "single_null_terminator",
+            input: "\0",
+            test_fn: |msg| {
+                msg.i = 0;
+                let result = msg.next_string();
+                result.is_ok() && result.unwrap().is_empty()
+            },
+        },
+        TestCase {
+            name: "multiple_null_terminators",
+            input: "\0\0\0",
+            test_fn: |msg| {
+                msg.i = 0;
+                let result = msg.next_string();
+                result.is_ok() && result.unwrap().is_empty()
+            },
+        },
+        TestCase {
+            name: "malformed_int",
+            input: "not_an_int\0",
+            test_fn: |msg| {
+                msg.i = 0;
+                msg.next_int().is_err()
+            },
+        },
+        TestCase {
+            name: "malformed_double",
+            input: "not_a_double\0",
+            test_fn: |msg| {
+                msg.i = 0;
+                msg.next_double().is_err()
+            },
+        },
+        TestCase {
+            name: "overflow_int",
+            input: "99999999999999999999\0",
+            test_fn: |msg| {
+                msg.i = 0;
+                msg.next_int().is_err()
+            },
+        },
+    ];
+
+    for test_case in test_cases {
+        let mut message = ResponseMessage::from(test_case.input);
+        assert!((test_case.test_fn)(&mut message), "Test '{}' failed", test_case.name);
+    }
+}
+
+#[test]
+fn test_channel_mappings_completeness() {
+    use super::shared_channel_configuration::CHANNEL_MAPPINGS;
+
+    // Verify that each mapping has at least one response
+    for mapping in CHANNEL_MAPPINGS {
+        assert!(
+            !mapping.responses.is_empty(),
+            "Channel mapping for {:?} has no responses",
+            mapping.request
+        );
+    }
+
+    // Test specific known mappings
+    let mappings = CHANNEL_MAPPINGS;
+
+    // Find RequestPositions mapping
+    let positions_mapping = mappings
+        .iter()
+        .find(|m| matches!(m.request, OutgoingMessages::RequestPositions))
+        .expect("RequestPositions mapping should exist");
+
+    assert_eq!(positions_mapping.responses.len(), 2);
+    assert!(positions_mapping.responses.contains(&IncomingMessages::Position));
+    assert!(positions_mapping.responses.contains(&IncomingMessages::PositionEnd));
+
+    // Find RequestAccountData mapping
+    let account_data_mapping = mappings
+        .iter()
+        .find(|m| matches!(m.request, OutgoingMessages::RequestAccountData))
+        .expect("RequestAccountData mapping should exist");
+
+    assert_eq!(account_data_mapping.responses.len(), 4);
+    assert!(account_data_mapping.responses.contains(&IncomingMessages::AccountValue));
+    assert!(account_data_mapping.responses.contains(&IncomingMessages::PortfolioValue));
+    assert!(account_data_mapping.responses.contains(&IncomingMessages::AccountDownloadEnd));
+    assert!(account_data_mapping.responses.contains(&IncomingMessages::AccountUpdateTime));
+}
+
+#[test]
+fn test_exclusive_one_shot_response_types() {
+    use super::shared_channel_configuration::exclusive_one_shot_response_types;
+
+    let one_shot = exclusive_one_shot_response_types();
+
+    // Genuine one-shots (single terminating response) are eligible for fail-fast.
+    for included in [
+        IncomingMessages::NextValidId,
+        IncomingMessages::MarketRule,
+        IncomingMessages::ManagedAccounts,
+        IncomingMessages::FamilyCodes,
+    ] {
+        assert!(one_shot.contains(&included), "{included:?} should be a one-shot error response type");
+    }
+
+    // Streaming channels are excluded so an unrelated error never terminates a
+    // live subscription — including NewsBulletins, which streams without an
+    // `*End` marker. MarketDataType and WshEventData are not in the table at all
+    // (their callers use request-id-keyed channels).
+    for excluded in [
+        IncomingMessages::OpenOrder,
+        IncomingMessages::OrderStatus,
+        IncomingMessages::Position,
+        IncomingMessages::PositionMulti,
+        IncomingMessages::AccountValue,
+        IncomingMessages::NewsBulletins,
+        IncomingMessages::MarketDataType,
+        IncomingMessages::WshEventData,
+    ] {
+        assert!(!one_shot.contains(&excluded), "{excluded:?} is streaming and must not be fail-fast");
+    }
+}
+
+#[test]
+fn test_is_one_shot_request() {
+    use super::shared_channel_configuration::{is_one_shot_request, CHANNEL_MAPPINGS};
+
+    // Every mapping's flag round-trips through the request-side lookup.
+    for mapping in CHANNEL_MAPPINGS {
+        assert_eq!(
+            is_one_shot_request(mapping.request),
+            mapping.one_shot,
+            "{:?} lookup should match its mapping's one_shot flag",
+            mapping.request
+        );
+    }
+
+    // A request without a shared-channel mapping is not one-shot.
+    assert!(!is_one_shot_request(OutgoingMessages::RequestMarketData));
+}
+
+#[test]
+fn test_notice_edge_cases() {
+    struct TestCase {
+        name: &'static str,
+        code: i32,
+        msg: &'static str,
+    }
+
+    let test_cases = vec![
+        TestCase {
+            name: "normal_error",
+            code: 2107,
+            msg: "HMDS data farm connection is inactive.",
+        },
+        TestCase {
+            name: "empty_message",
+            code: 1000,
+            msg: "",
+        },
+        TestCase {
+            name: "negative_code",
+            code: -500,
+            msg: "Negative error code",
+        },
+    ];
+
+    for test_case in test_cases {
+        let message = crate::common::test_utils::helpers::proto_error_response(-1, test_case.code, test_case.msg);
+        let notice = Notice::from(&message);
+
+        assert_eq!(notice.code, test_case.code, "Test '{}' failed: wrong error code", test_case.name);
+        assert_eq!(notice.message, test_case.msg, "Test '{}' failed: wrong error message", test_case.name);
+    }
+}
+
+#[test]
+fn test_notice_is_cancellation() {
+    // Code 202 = order cancelled
+    let cancellation = Notice {
+        code: 202,
+        message: "Order Cancelled - reason:".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+    assert!(cancellation.is_cancellation());
+    assert!(!cancellation.is_warning());
+    assert!(!cancellation.is_system_message());
+    assert!(cancellation.is_informational());
+    assert!(!cancellation.is_error());
+
+    // Other codes are not cancellations
+    let error = Notice {
+        code: 200,
+        message: "No security definition found".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+    assert!(!error.is_cancellation());
+}
+
+#[test]
+fn test_notice_is_warning() {
+    // Codes 2100-2169 are warnings
+    let warning_codes = [2100, 2107, 2119, 2150, 2169];
+    for code in warning_codes {
+        let notice = Notice {
+            code,
+            message: format!("Warning with code {}", code),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        assert!(notice.is_warning(), "Code {} should be a warning", code);
+        assert!(!notice.is_cancellation());
+        assert!(!notice.is_system_message());
+        assert!(notice.is_informational());
+        assert!(!notice.is_error());
+    }
+
+    // Codes outside 2100-2169 are not warnings
+    let non_warning_codes = [2099, 2170, 200, 202, 1000];
+    for code in non_warning_codes {
+        let notice = Notice {
+            code,
+            message: format!("Non-warning with code {}", code),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        assert!(!notice.is_warning(), "Code {} should not be a warning", code);
+    }
+}
+
+#[test]
+fn test_notice_is_system_message() {
+    // System message codes: 1100, 1101, 1102, 1300
+    let system_codes = [
+        (1100, "Connectivity between IB and TWS has been lost."),
+        (1101, "Connectivity restored, data lost."),
+        (1102, "Connectivity restored, data maintained."),
+        (1300, "Socket port has been reset."),
+    ];
+    for (code, msg) in system_codes {
+        let notice = Notice {
+            code,
+            message: msg.to_string(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        assert!(notice.is_system_message(), "Code {} should be a system message", code);
+        assert!(!notice.is_cancellation());
+        assert!(!notice.is_warning());
+        assert!(notice.is_informational());
+        assert!(!notice.is_error());
+    }
+
+    // Non-system codes
+    let non_system_codes = [200, 202, 1099, 1103, 1299, 1301, 2100];
+    for code in non_system_codes {
+        let notice = Notice {
+            code,
+            message: format!("Non-system message with code {}", code),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        assert!(!notice.is_system_message(), "Code {} should not be a system message", code);
+    }
+}
+
+#[test]
+fn test_notice_is_informational() {
+    // Informational includes cancellations, warnings, and system messages
+    let informational_codes = [202, 1100, 1101, 1102, 1300, 2100, 2107, 2169];
+    for code in informational_codes {
+        let notice = Notice {
+            code,
+            message: format!("Informational code {}", code),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        assert!(notice.is_informational(), "Code {} should be informational", code);
+        assert!(!notice.is_error(), "Code {} should not be an error", code);
+    }
+
+    // Non-informational (actual errors)
+    let error_codes = [100, 200, 201, 321, 502, 10000];
+    for code in error_codes {
+        let notice = Notice {
+            code,
+            message: format!("Error code {}", code),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        assert!(!notice.is_informational(), "Code {} should not be informational", code);
+        assert!(notice.is_error(), "Code {} should be an error", code);
+    }
+}
+
+#[test]
+fn test_notice_is_error() {
+    // Code 200 = actual error
+    let error = Notice {
+        code: 200,
+        message: "No security definition found".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+    assert!(error.is_error());
+    assert!(!error.is_informational());
+
+    // Code 202 = cancellation, not error
+    let cancellation = Notice {
+        code: 202,
+        message: "Order Cancelled".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+    assert!(!cancellation.is_error());
+    assert!(cancellation.is_informational());
+
+    // Code 1100 = system message, not error
+    let system_msg = Notice {
+        code: 1100,
+        message: "Connectivity lost".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+    assert!(!system_msg.is_error());
+    assert!(system_msg.is_informational());
+
+    // Code 2107 = warning, not error
+    let warning = Notice {
+        code: 2107,
+        message: "HMDS data farm connection is inactive.".to_string(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    };
+    assert!(!warning.is_error());
+    assert!(warning.is_informational());
+}
+
+fn notice_with_code(code: i32) -> Notice {
+    Notice {
+        code,
+        message: String::new(),
+        error_time: None,
+        advanced_order_reject_json: String::new(),
+    }
+}
+
+#[test]
+fn test_notice_is_order_rejection() {
+    let start = *ORDER_REJECTION_CODE_RANGE.start();
+    let end = *ORDER_REJECTION_CODE_RANGE.end();
+
+    for code in [start, start + 1, ORDER_CANCELLED_CODE, end - 1, end] {
+        assert!(notice_with_code(code).is_order_rejection(), "code {code} should be order rejection");
+    }
+
+    for code in [start - 1, end + 1, 100, *WARNING_CODE_RANGE.start(), SYSTEM_MESSAGE_CODES[0], 10000] {
+        assert!(!notice_with_code(code).is_order_rejection(), "code {code} should not be order rejection");
+    }
+}
+
+#[test]
+fn test_notice_category_partition() {
+    let cases: &[(i32, NoticeCategory)] = &[
+        (ORDER_CANCELLED_CODE, NoticeCategory::Cancellation), // 202 — precedence over OrderRejection
+        (*WARNING_CODE_RANGE.start(), NoticeCategory::Warning),
+        (*WARNING_CODE_RANGE.end(), NoticeCategory::Warning),
+        (SYSTEM_MESSAGE_CODES[0], NoticeCategory::SystemMessage),
+        (SYSTEM_MESSAGE_CODES[3], NoticeCategory::SystemMessage),
+        (*ORDER_REJECTION_CODE_RANGE.start(), NoticeCategory::OrderRejection), // 200
+        (*ORDER_REJECTION_CODE_RANGE.start() + 1, NoticeCategory::OrderRejection), // 201 — hard rejection
+        (*ORDER_REJECTION_CODE_RANGE.end(), NoticeCategory::OrderRejection),   // 399
+        (DATA_ADVISORY_CODES[0], NoticeCategory::DataAdvisory),
+        (DATA_ADVISORY_CODES[1], NoticeCategory::DataAdvisory),
+        (100, NoticeCategory::Error),
+        (502, NoticeCategory::Error),
+        (10000, NoticeCategory::Error),
+    ];
+
+    for &(code, expected) in cases {
+        assert_eq!(notice_with_code(code).category(), expected, "code {code} miscategorised");
+    }
+}
+
+#[test]
+fn test_connectivity_status_from_code_table() {
+    // Derive expectations from the code constants (rule 21): each farm-code set
+    // maps to its status; everything else maps to None.
+    let cases: &[(&[i32], ConnectivityStatus)] = &[
+        (&FARM_OK_CODES, ConnectivityStatus::Ok),
+        (&FARM_BROKEN_CODES, ConnectivityStatus::Broken),
+        (&FARM_INACTIVE_CODES, ConnectivityStatus::Inactive),
+        (&FARM_CONNECTING_CODES, ConnectivityStatus::Connecting),
+    ];
+    for &(codes, expected) in cases {
+        for &code in codes {
+            assert_eq!(ConnectivityStatus::from_code(code), Some(expected), "code {code} misclassified");
+        }
+    }
+
+    // Non-farm codes — including warning-band neighbors and the range boundaries —
+    // carry no connectivity status.
+    for code in [2100, 2120, 2169, 500, 202, 1100] {
+        assert_eq!(ConnectivityStatus::from_code(code), None, "code {code} should have no status");
+    }
+}
+
+#[test]
+fn test_connectivity_status_delegates() {
+    // The accessor is a thin wrapper over from_code; assert delegation without
+    // re-asserting the whole table.
+    let code = FARM_BROKEN_CODES[0];
+    assert_eq!(notice_with_code(code).connectivity_status(), ConnectivityStatus::from_code(code));
+    assert_eq!(notice_with_code(500).connectivity_status(), None);
+}
+
+#[test]
+fn test_connectivity_status_subset_of_warning() {
+    // Additive contract: every farm code is still a Warning under the existing
+    // partition — connectivity_status refines, it doesn't repartition.
+    let all_farm = FARM_OK_CODES
+        .iter()
+        .chain(&FARM_BROKEN_CODES)
+        .chain(&FARM_INACTIVE_CODES)
+        .chain(&FARM_CONNECTING_CODES);
+    for &code in all_farm {
+        let notice = notice_with_code(code);
+        assert!(notice.is_warning(), "farm code {code} should be a warning");
+        assert_eq!(
+            notice.category(),
+            NoticeCategory::Warning,
+            "farm code {code} should categorise as Warning"
+        );
+        assert!(WARNING_CODE_RANGE.contains(&code), "farm code {code} should be inside WARNING_CODE_RANGE");
+    }
+}
+
+#[test]
+fn test_notice_data_advisory() {
+    // Delayed-data advisories are informational: TWS proceeds with the request
+    // and data follows, so they must not be classified as errors.
+    for code in DATA_ADVISORY_CODES {
+        let notice = notice_with_code(code);
+        assert!(notice.is_data_advisory(), "code {code} should be a data advisory");
+        assert!(notice.is_informational(), "code {code} should be informational");
+        assert!(!notice.is_error(), "code {code} should not be an error");
+        assert_eq!(notice.category(), NoticeCategory::DataAdvisory, "code {code} miscategorised");
+
+        // Neighboring codes are real errors, not advisories.
+        for neighbor in [code - 1, code + 1] {
+            let notice = notice_with_code(neighbor);
+            assert!(!notice.is_data_advisory(), "code {neighbor} should not be a data advisory");
+            assert!(notice.is_error(), "code {neighbor} should be an error");
+        }
+    }
+}
+
+#[test]
+fn test_handshake_synthetic_constants_pinned() {
+    // Hard pin the wire values — these are part of the public API and may not
+    // shift silently. Negative codes never collide with TWS-emitted codes (TWS
+    // uses 0+); -2 is taken by `ResponseMessage::is_shutdown`.
+    assert_eq!(HANDSHAKE_UNKNOWN_FRAME_CODE, -3);
+    assert_eq!(HANDSHAKE_DECODE_FAILURE_CODE, -4);
+    assert_ne!(HANDSHAKE_UNKNOWN_FRAME_CODE, HANDSHAKE_DECODE_FAILURE_CODE);
+}
+
+#[test]
+fn test_is_handshake_synthetic() {
+    assert!(notice_with_code(HANDSHAKE_UNKNOWN_FRAME_CODE).is_handshake_synthetic());
+    assert!(notice_with_code(HANDSHAKE_DECODE_FAILURE_CODE).is_handshake_synthetic());
+
+    // TWS-emitted codes must not pass the predicate.
+    for code in [
+        0,
+        ORDER_CANCELLED_CODE,
+        *WARNING_CODE_RANGE.start(),
+        *WARNING_CODE_RANGE.end(),
+        SYSTEM_MESSAGE_CODES[0],
+        *ORDER_REJECTION_CODE_RANGE.start(),
+        *ORDER_REJECTION_CODE_RANGE.end(),
+        -2, // shutdown sentinel — distinct sentinel, must not be confused with handshake-synthetic
+        -1,
+        100,
+    ] {
+        assert!(
+            !notice_with_code(code).is_handshake_synthetic(),
+            "code {code} should not be flagged handshake-synthetic"
+        );
+    }
+}
+
+#[test]
+fn test_all_incoming_message_conversions() {
+    // Test boundary values and ensure all message types are covered
+    let test_cases = vec![
+        (0, IncomingMessages::NotValid),
+        (1, IncomingMessages::TickPrice),
+        (108, IncomingMessages::HistoricalDataEnd),
+        (109, IncomingMessages::CurrentTimeInMillis),
+        (110, IncomingMessages::ConfigResponse),
+        (111, IncomingMessages::UpdateConfigResponse),
+        (112, IncomingMessages::NotValid),
+        (i32::MAX, IncomingMessages::NotValid),
+        (i32::MIN, IncomingMessages::NotValid),
+        (-1, IncomingMessages::NotValid),
+    ];
+
+    for (value, expected) in test_cases {
+        assert_eq!(IncomingMessages::from(value), expected, "Failed for value {}", value);
+    }
+}
+
+#[test]
+fn test_outgoing_message_display() {
+    // Test Display implementation for OutgoingMessages
+    let test_cases = vec![
+        (OutgoingMessages::RequestMarketData, "1"),
+        (OutgoingMessages::CancelMarketData, "2"),
+        (OutgoingMessages::PlaceOrder, "3"),
+        (OutgoingMessages::CancelOrder, "4"),
+        (OutgoingMessages::RequestOpenOrders, "5"),
+        (OutgoingMessages::RequestIds, "8"),
+        (OutgoingMessages::RequestCurrentTime, "49"),
+        (OutgoingMessages::RequestAccountSummary, "62"),
+        (OutgoingMessages::RequestPnL, "92"),
+        (OutgoingMessages::RequestUserInfo, "104"),
+    ];
+
+    for (msg, expected) in test_cases {
+        assert_eq!(format!("{}", msg), expected);
+    }
+}
+
+#[test]
+fn test_encode_length_edge_cases() {
+    // Test with various sizes
+    let x255 = "x".repeat(255);
+    let x256 = "x".repeat(256);
+    let x1000 = "x".repeat(1000);
+
+    let test_cases = vec![
+        ("", 4),                // Empty string
+        ("x", 5),               // Single character
+        (x255.as_str(), 259),   // 255 characters
+        (x256.as_str(), 260),   // 256 characters
+        (x1000.as_str(), 1004), // 1000 characters
+    ];
+
+    for (input, expected_len) in test_cases {
+        let encoded = encode_length(input);
+        assert_eq!(encoded.len(), expected_len);
+
+        // Verify the encoded length is correct
+        let length_bytes = &encoded[0..4];
+        let decoded_length = u32::from_be_bytes([length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3]]);
+        assert_eq!(decoded_length as usize, input.len());
+    }
+}
+
+#[test]
+fn test_response_message_access_patterns() {
+    let message = ResponseMessage::from("5\0123\0field2\0field3\0field4\0");
+
+    // Test message_type
+    assert_eq!(message.message_type(), IncomingMessages::OpenOrder);
+
+    // Test multiple peeks don't change state
+    assert_eq!(message.peek_int(1).unwrap(), 123);
+    assert_eq!(message.peek_int(1).unwrap(), 123);
+
+    assert_eq!(message.fields.len(), 5);
+}
+
+#[test]
+fn test_response_message_fields_modification() {
+    // Test that ResponseMessage handles field modification correctly
+    let mut message = ResponseMessage::from("1\02\03\0");
+    assert_eq!(message.fields.len(), 3);
+    assert_eq!(message.fields[0], "1");
+    assert_eq!(message.fields[1], "2");
+    assert_eq!(message.fields[2], "3");
+
+    // Test that we can read fields correctly after creation
+    message.i = 0;
+    assert_eq!(message.next_int().unwrap(), 1);
+    assert_eq!(message.next_int().unwrap(), 2);
+    assert_eq!(message.next_int().unwrap(), 3);
+}
+
+#[test]
+fn test_incoming_messages_equality() {
+    // Test that IncomingMessages enum variants are properly comparable
+    assert_eq!(IncomingMessages::TickPrice, IncomingMessages::TickPrice);
+    assert_ne!(IncomingMessages::TickPrice, IncomingMessages::TickSize);
+
+    // Test with from conversion
+    assert_eq!(IncomingMessages::from(1), IncomingMessages::TickPrice);
+    assert_eq!(IncomingMessages::from(2), IncomingMessages::TickSize);
+    assert_ne!(IncomingMessages::from(1), IncomingMessages::from(2));
+}
+
+// Additional tests for comprehensive FromStr coverage of OutgoingMessages
+#[test]
+fn test_outgoing_messages_from_str_comprehensive() {
+    use std::str::FromStr;
+
+    // Table-driven test for all OutgoingMessages variants
+    let test_cases = vec![
+        ("1", OutgoingMessages::RequestMarketData),
+        ("2", OutgoingMessages::CancelMarketData),
+        ("3", OutgoingMessages::PlaceOrder),
+        ("4", OutgoingMessages::CancelOrder),
+        ("5", OutgoingMessages::RequestOpenOrders),
+        ("6", OutgoingMessages::RequestAccountData),
+        ("7", OutgoingMessages::RequestExecutions),
+        ("8", OutgoingMessages::RequestIds),
+        ("9", OutgoingMessages::RequestContractData),
+        ("10", OutgoingMessages::RequestMarketDepth),
+        ("11", OutgoingMessages::CancelMarketDepth),
+        ("12", OutgoingMessages::RequestNewsBulletins),
+        ("13", OutgoingMessages::CancelNewsBulletin),
+        ("14", OutgoingMessages::ChangeServerLog),
+        ("15", OutgoingMessages::RequestAutoOpenOrders),
+        ("16", OutgoingMessages::RequestAllOpenOrders),
+        ("17", OutgoingMessages::RequestManagedAccounts),
+        ("18", OutgoingMessages::RequestFA),
+        ("19", OutgoingMessages::ReplaceFA),
+        ("20", OutgoingMessages::RequestHistoricalData),
+        ("21", OutgoingMessages::ExerciseOptions),
+        ("22", OutgoingMessages::RequestScannerSubscription),
+        ("23", OutgoingMessages::CancelScannerSubscription),
+        ("24", OutgoingMessages::RequestScannerParameters),
+        ("25", OutgoingMessages::CancelHistoricalData),
+        ("49", OutgoingMessages::RequestCurrentTime),
+        ("50", OutgoingMessages::RequestRealTimeBars),
+        ("51", OutgoingMessages::CancelRealTimeBars),
+        ("52", OutgoingMessages::RequestFundamentalData),
+        ("53", OutgoingMessages::CancelFundamentalData),
+        ("54", OutgoingMessages::ReqCalcImpliedVolat),
+        ("55", OutgoingMessages::ReqCalcOptionPrice),
+        ("56", OutgoingMessages::CancelImpliedVolatility),
+        ("57", OutgoingMessages::CancelOptionPrice),
+        ("58", OutgoingMessages::RequestGlobalCancel),
+        ("59", OutgoingMessages::RequestMarketDataType),
+        ("61", OutgoingMessages::RequestPositions),
+        ("62", OutgoingMessages::RequestAccountSummary),
+        ("63", OutgoingMessages::CancelAccountSummary),
+        ("64", OutgoingMessages::CancelPositions),
+        ("65", OutgoingMessages::VerifyRequest),
+        ("66", OutgoingMessages::VerifyMessage),
+        ("67", OutgoingMessages::QueryDisplayGroups),
+        ("68", OutgoingMessages::SubscribeToGroupEvents),
+        ("69", OutgoingMessages::UpdateDisplayGroup),
+        ("70", OutgoingMessages::UnsubscribeFromGroupEvents),
+        ("71", OutgoingMessages::StartApi),
+        ("72", OutgoingMessages::VerifyAndAuthRequest),
+        ("73", OutgoingMessages::VerifyAndAuthMessage),
+        ("74", OutgoingMessages::RequestPositionsMulti),
+        ("75", OutgoingMessages::CancelPositionsMulti),
+        ("76", OutgoingMessages::RequestAccountUpdatesMulti),
+        ("77", OutgoingMessages::CancelAccountUpdatesMulti),
+        ("78", OutgoingMessages::RequestSecurityDefinitionOptionalParameters),
+        ("79", OutgoingMessages::RequestSoftDollarTiers),
+        ("80", OutgoingMessages::RequestFamilyCodes),
+        ("81", OutgoingMessages::RequestMatchingSymbols),
+        ("82", OutgoingMessages::RequestMktDepthExchanges),
+        ("83", OutgoingMessages::RequestSmartComponents),
+        ("84", OutgoingMessages::RequestNewsArticle),
+        ("85", OutgoingMessages::RequestNewsProviders),
+        ("86", OutgoingMessages::RequestHistoricalNews),
+        ("87", OutgoingMessages::RequestHeadTimestamp),
+        ("88", OutgoingMessages::RequestHistogramData),
+        ("89", OutgoingMessages::CancelHistogramData),
+        ("90", OutgoingMessages::CancelHeadTimestamp),
+        ("91", OutgoingMessages::RequestMarketRule),
+        ("92", OutgoingMessages::RequestPnL),
+        ("93", OutgoingMessages::CancelPnL),
+        ("94", OutgoingMessages::RequestPnLSingle),
+        ("95", OutgoingMessages::CancelPnLSingle),
+        ("96", OutgoingMessages::RequestHistoricalTicks),
+        ("97", OutgoingMessages::RequestTickByTickData),
+        ("98", OutgoingMessages::CancelTickByTickData),
+        ("99", OutgoingMessages::RequestCompletedOrders),
+        ("100", OutgoingMessages::RequestWshMetaData),
+        ("101", OutgoingMessages::CancelWshMetaData),
+        ("102", OutgoingMessages::RequestWshEventData),
+        ("103", OutgoingMessages::CancelWshEventData),
+        ("104", OutgoingMessages::RequestUserInfo),
+        ("105", OutgoingMessages::RequestCurrentTimeInMillis),
+        ("106", OutgoingMessages::CancelContractData),
+        ("107", OutgoingMessages::CancelHistoricalTicks),
+        ("108", OutgoingMessages::ReqConfig),
+        ("109", OutgoingMessages::UpdateConfig),
+    ];
+
+    for (input, expected) in test_cases {
+        let result = OutgoingMessages::from_str(input).unwrap();
+        assert_eq!(result, expected, "Failed to parse '{}' as {:?}", input, expected);
+    }
+
+    // Test invalid cases
+    assert!(OutgoingMessages::from_str("110").is_err());
+    assert!(OutgoingMessages::from_str("999").is_err());
+    assert!(OutgoingMessages::from_str("-1").is_err());
+    assert!(OutgoingMessages::from_str("abc").is_err());
+    assert!(OutgoingMessages::from_str("").is_err());
+}
+
+#[test]
+fn test_routes_by_request_id_comprehensive() {
+    // Confirm the allow-list covers a representative slice across domains.
+    assert!(routes_by_request_id(IncomingMessages::MarketDepthL2));
+    assert!(routes_by_request_id(IncomingMessages::TickReqParams));
+    assert!(routes_by_request_id(IncomingMessages::TickSnapshotEnd));
+
+    // Shared/global messages are deliberately omitted.
+    assert!(!routes_by_request_id(IncomingMessages::ManagedAccounts));
+    assert!(!routes_by_request_id(IncomingMessages::NextValidId));
+    assert!(!routes_by_request_id(IncomingMessages::CurrentTime));
+}
+
+#[test]
+fn test_response_message_error_paths() {
+    // Test empty message type detection
+    let empty_msg = ResponseMessage::default();
+    assert_eq!(empty_msg.message_type(), IncomingMessages::NotValid);
+}
+
+#[test]
+fn test_response_message_special_double_values() {
+    // Test parsing empty as 0.0
+    let mut msg = ResponseMessage::from("test\0\0");
+    msg.i = 1;
+    let result = msg.next_double().unwrap();
+    assert_eq!(result, 0.0);
+
+    // Test parsing "0" as 0.0
+    let mut msg = ResponseMessage::from("test\00\0");
+    msg.i = 1;
+    let result = msg.next_double().unwrap();
+    assert_eq!(result, 0.0);
+
+    // Test parsing "0.0" as 0.0
+    let mut msg = ResponseMessage::from("test\00.0\0");
+    msg.i = 1;
+    let result = msg.next_double().unwrap();
+    assert_eq!(result, 0.0);
+}

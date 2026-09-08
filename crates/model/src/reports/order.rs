@@ -111,6 +111,12 @@ pub struct OrderStatusReport {
     pub cancel_reason: Option<String>,
     /// UNIX timestamp (nanoseconds) when the order was triggered.
     pub ts_triggered: Option<UnixNanos>,
+    /// The raw broker order status string as received from the venue, when
+    /// the adapter preserves it (e.g. IBKR). `None` for adapters that do
+    /// not provide raw provenance. Recognized and unknown values are
+    /// preserved byte-for-byte; trust adjudication is the consumer's
+    /// responsibility (C2.6).
+    pub raw_order_status: Option<String>,
 }
 
 impl OrderStatusReport {
@@ -167,6 +173,7 @@ impl OrderStatusReport {
             reduce_only: false,
             cancel_reason: None,
             ts_triggered: None,
+            raw_order_status: None,
         }
     }
 
@@ -309,6 +316,13 @@ impl OrderStatusReport {
         self
     }
 
+    /// Sets the raw broker order status string.
+    #[must_use]
+    pub fn with_raw_order_status(mut self, raw_order_status: String) -> Self {
+        self.raw_order_status = Some(raw_order_status);
+        self
+    }
+
     /// Sets the contingency type.
     #[must_use]
     pub const fn with_contingency_type(mut self, contingency_type: ContingencyType) -> Self {
@@ -380,7 +394,8 @@ impl Display for OrderStatusReport {
                 post_only={}, \
                 reduce_only={}, \
                 cancel_reason={:?}, \
-                ts_triggered={:?}\
+                ts_triggered={:?}, \
+                raw_order_status={:?}\
             )",
             self.account_id,
             self.instrument_id,
@@ -421,6 +436,7 @@ impl Display for OrderStatusReport {
             self.reduce_only,
             self.cancel_reason,
             self.ts_triggered,
+            self.raw_order_status,
         )
     }
 }
@@ -503,6 +519,18 @@ mod tests {
         assert!(!report.reduce_only);
         assert_eq!(report.cancel_reason, None);
         assert_eq!(report.ts_triggered, None);
+        assert_eq!(report.raw_order_status, None);
+    }
+
+    #[rstest]
+    fn test_order_status_report_with_raw_order_status() {
+        let report = test_order_status_report()
+            .with_raw_order_status("SomeFutureIbkrStatus".to_string());
+
+        assert_eq!(
+            report.raw_order_status.as_deref(),
+            Some("SomeFutureIbkrStatus"),
+        );
     }
 
     #[rstest]

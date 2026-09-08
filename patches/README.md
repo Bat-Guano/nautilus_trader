@@ -41,3 +41,43 @@ pinned `pyo3-stub-gen 0.20.0` code.
 
 Do not update `pyo3-stub-gen` or remove this patch until stub generation no longer depends on the
 package module paths outside the `pymodule` root.
+
+
+## ibapi
+
+`ibapi` stays pinned to 3.3.0 (upstream commit `b140b312d1136d240f3b5651a89f4778e01aa222`,
+MIT license, source: `https://github.com/wboayue/rust-ibapi`). Public `ibapi` 4.0.0 still uses
+a strict order-status enum and is not a substitute; do not upgrade in C2.6.
+
+The local copy makes one narrowly scoped change: `OrderStatusKind` gains an
+`Unknown(String)` variant so an order-status string outside the known nine-value vocabulary
+decodes successfully with its raw value preserved byte-for-byte (C2.6). Behavioral delta:
+
+- `OrderStatusKind::Unknown(String)` carries the exact original status string;
+- `Copy` is removed from `OrderStatusKind` (`Unknown(String)` owns a `String`);
+- `as_str()` returns `&str`; known variants keep their exact wire strings, `Unknown`
+  returns the stored original;
+- `FromStr` maps unknown non-empty strings to `Unknown(original)` instead of
+  `Error::Parse`, so an unknown status no longer terminates the order-update
+  subscription; missing/empty required fields still fail as `Error::Parse`
+  (message integrity handling is unchanged);
+- `Display` / `ToField` / serde keep round-tripping; serialization of the nine known
+  variants is unchanged (`Unknown` serializes as `{"Unknown": "..."}`);
+- `is_active()` / `is_terminal()` return `false` for `Unknown` (unknown is neither).
+
+Vendor hygiene (offline build constraints; no behavioral delta):
+
+- the optional `utoipa` dependency/feature is removed — the workspace never enables it
+  and its registry index metadata is not available offline; the
+  `cfg_attr(feature = "utoipa", ...)` attributes were stripped accordingly and the
+  utoipa-only `schema_derives_work` test module in `src/contracts/mod.rs` was removed;
+- example targets are removed from the vendored manifest (their sources are not
+  vendored and the workspace never builds them);
+- dev-dependencies `serial_test` and `temp-env` are removed because they are not
+  available in the offline registry cache; the affected upstream tests were adapted
+  mechanically (`src/transport/recorder_tests.rs` uses a local env-var guard; the trace
+  tests drop the `#[serial]` attribute — run the vendored test suite with
+  `--test-threads=1` to preserve the serialization guarantee).
+
+Remove this patch when upstream `ibapi` supports preserving unknown order-status
+strings through decode in the pinned major line.

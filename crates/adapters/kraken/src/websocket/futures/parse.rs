@@ -297,6 +297,7 @@ pub fn parse_futures_ws_order_status_report(
         reduce_only: order.reduce_only,
         cancel_reason: None,
         ts_triggered: None,
+        raw_order_status: None,
     };
 
     if let Some(px) = order.limit_price {

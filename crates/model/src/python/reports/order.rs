@@ -75,6 +75,7 @@ impl OrderStatusReport {
         reduce_only=false,
         cancel_reason=None,
         ts_triggered=None,
+        raw_order_status=None,
     ))]
     fn py_new(
         account_id: AccountId,
@@ -110,6 +111,7 @@ impl OrderStatusReport {
         reduce_only: bool,
         cancel_reason: Option<String>,
         ts_triggered: Option<u64>,
+        raw_order_status: Option<String>,
     ) -> Self {
         let mut report = Self::new(
             account_id,
@@ -202,6 +204,10 @@ impl OrderStatusReport {
 
         if let Some(ts_triggered) = ts_triggered {
             report = report.with_ts_triggered(ts_triggered.into());
+        }
+
+        if let Some(raw_order_status) = raw_order_status {
+            report = report.with_raw_order_status(raw_order_status);
         }
 
         report
@@ -422,6 +428,12 @@ impl OrderStatusReport {
     }
 
     #[getter]
+    #[pyo3(name = "raw_order_status")]
+    fn py_raw_order_status(&self) -> Option<String> {
+        self.raw_order_status.clone()
+    }
+
+    #[getter]
     #[pyo3(name = "is_open")]
     fn py_is_open(&self) -> bool {
         matches!(
@@ -568,6 +580,11 @@ impl OrderStatusReport {
         match &self.ts_triggered {
             Some(t) => dict.set_item("ts_triggered", t.as_u64())?,
             None => dict.set_item("ts_triggered", py.None())?,
+        }
+
+        match &self.raw_order_status {
+            Some(raw) => dict.set_item("raw_order_status", raw)?,
+            None => dict.set_item("raw_order_status", py.None())?,
         }
 
         Ok(dict.into())
