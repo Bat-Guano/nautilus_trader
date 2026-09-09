@@ -24,8 +24,8 @@ use nautilus_core::{
     UUID4,
     python::{to_pyruntime_err, to_pyvalue_err},
 };
-use nautilus_model::identifiers::TraderId;
-use pyo3::{Py, Python, prelude::*, types::PyBytes};
+use nautilus_model::{identifiers::TraderId, reports::OrderStatusReport};
+use pyo3::{IntoPyObjectExt, Py, Python, prelude::*, types::PyBytes};
 use ustr::Ustr;
 
 use crate::{
@@ -286,8 +286,11 @@ impl Debug for PyMessage {
 
 /// Adapts a Python callable as a [`ShareableMessageHandler`].
 ///
-/// Expects messages to be [`PyMessage`] instances. Acquires the GIL and calls
-/// the Python callable with the inner Python object.
+/// Dispatches [`PyMessage`] payloads (the Python publish path) and genuine
+/// Rust [`OrderStatusReport`] values published through the same Any-based
+/// `publish_any` path used by `ExecutionEngine`. Other Rust types remain
+/// unsupported and are logged, matching the previous non-`PyMessage` behavior.
+/// Acquires the GIL and calls the Python callable with a Python object.
 pub struct PyCallableHandler {
     id: Ustr,
     callable: Py<PyAny>,
@@ -319,18 +322,32 @@ impl Handler<dyn Any> for PyCallableHandler {
     }
 
     fn handle(&self, message: &dyn Any) {
-        if let Some(py_msg) = message.downcast_ref::<PyMessage>() {
-            Python::attach(|py| {
-                if let Err(e) = self.callable.call1(py, (&py_msg.0,)) {
-                    log::error!("Python handler {id} failed: {e}", id = self.id);
+        Python::attach(|py| {
+            let py_obj = if let Some(py_msg) = message.downcast_ref::<PyMessage>() {
+                py_msg.0.clone_ref(py)
+            } else if let Some(report) = message.downcast_ref::<OrderStatusReport>() {
+                match report.clone().into_py_any(py) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        log::error!(
+                            "Python handler {id} failed to convert OrderStatusReport: {e}",
+                            id = self.id
+                        );
+                        return;
+                    }
                 }
-            });
-        } else {
-            log::error!(
-                "Python handler {id} received non-PyMessage type",
-                id = self.id
-            );
-        }
+            } else {
+                log::error!(
+                    "Python handler {id} received non-PyMessage type",
+                    id = self.id
+                );
+                return;
+            };
+
+            if let Err(e) = self.callable.call1(py, (&py_obj,)) {
+                log::error!("Python handler {id} failed: {e}", id = self.id);
+            }
+        });
     }
 }
 
@@ -790,8 +807,9 @@ fn parse_pattern(pattern: &str) -> PyResult<MStr<Pattern>> {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
+    use std::{any::Any, ffi::CString};
 
+    use nautilus_model::identifiers::{ClientOrderId, VenueOrderId};
     use pyo3::{exceptions::PyValueError, ffi::c_str};
     use rstest::rstest;
 
@@ -895,6 +913,360 @@ mod tests {
             let results = globals.get_item("results").unwrap().unwrap();
             let len: usize = results.len().unwrap();
             assert_eq!(len, 1);
+        });
+    }
+
+    fn rust_order_status_report(raw_order_status: &str) -> OrderStatusReport {
+        use nautilus_core::{UUID4, UnixNanos};
+        use nautilus_model::{
+            enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
+            identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
+            types::Quantity,
+        };
+        use rust_decimal::Decimal;
+
+        let mut report = OrderStatusReport::new(
+            AccountId::from("IB-DU1234567"),
+            InstrumentId::from("BTC/USD.PAXOS"),
+            Some(ClientOrderId::from("O-C2-8-P1-001")),
+            VenueOrderId::from("B-C2-8-P1-001"),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Submitted,
+            Quantity::from("100"),
+            Quantity::from("0"),
+            UnixNanos::from(1_700_000_000_000_000_001),
+            UnixNanos::from(1_700_000_000_000_000_002),
+            UnixNanos::from(1_700_000_000_000_000_003),
+            Some(UUID4::from("00000000-0000-4000-8000-0000000000c2")),
+        )
+        .with_raw_order_status(raw_order_status.to_string());
+        report.avg_px = Some(Decimal::ZERO);
+        report
+    }
+
+    fn capturing_python_handler<'py>(
+        py: Python<'py>,
+        source: &str,
+    ) -> (PyCallableHandler, Bound<'py, pyo3::types::PyDict>) {
+        let main = py.import("__main__").unwrap();
+        let globals = main.dict();
+        let code = CString::new(source).unwrap();
+        py.run(code.as_c_str(), Some(&globals), None).unwrap();
+        let handler_fn = globals.get_item("handler").unwrap().unwrap().unbind();
+        let handler = PyCallableHandler::new(py, handler_fn).unwrap();
+        (handler, globals)
+    }
+
+    #[rstest]
+    fn test_py_callable_handler_converts_rust_order_status_report() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let (handler, globals) =
+                capturing_python_handler(py, "results = []\ndef handler(x): results.append(x)");
+            let report = rust_order_status_report("PendingSubmit");
+            handler.handle(&report);
+
+            let results = globals.get_item("results").unwrap().unwrap();
+            assert_eq!(results.len().unwrap(), 1);
+            let received = results.get_item(0).unwrap();
+            assert_eq!(
+                received.get_type().name().unwrap().to_string_lossy(),
+                "OrderStatusReport"
+            );
+            let extracted: OrderStatusReport = received.extract().unwrap();
+            assert_eq!(extracted, report);
+            assert_eq!(extracted.raw_order_status.as_deref(), Some("PendingSubmit"));
+            assert_eq!(extracted.account_id.to_string(), "IB-DU1234567");
+            assert_eq!(
+                extracted.client_order_id.unwrap().to_string(),
+                "O-C2-8-P1-001"
+            );
+            assert_eq!(extracted.venue_order_id.to_string(), "B-C2-8-P1-001");
+            assert_eq!(extracted.instrument_id.to_string(), "BTC/USD.PAXOS");
+        });
+    }
+
+    #[rstest]
+    fn test_publish_any_delivers_order_status_report_to_python_subscriber() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            get_message_bus().borrow_mut().dispose();
+
+            let (handler, globals) =
+                capturing_python_handler(py, "results = []\ndef handler(x): results.append(x)");
+            let shareable = TypedHandler(Rc::new(handler) as Rc<dyn Handler<dyn Any>>);
+            let topic =
+                crate::msgbus::MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+            let pattern: MStr<Pattern> = topic.into();
+            msgbus_api::subscribe_any(pattern, shareable, None);
+
+            let pending = rust_order_status_report("PendingSubmit");
+            let unknown = rust_order_status_report("SomeFutureIbkrStatus");
+            msgbus_api::publish_any(topic, &pending);
+            msgbus_api::publish_any(topic, &unknown);
+            msgbus_api::publish_any(topic, &unknown);
+
+            let results = globals.get_item("results").unwrap().unwrap();
+            assert_eq!(
+                results.len().unwrap(),
+                3,
+                "one Rust publish must yield one Python invocation; duplicates are not deduped"
+            );
+
+            let first: OrderStatusReport = results.get_item(0).unwrap().extract().unwrap();
+            let second: OrderStatusReport = results.get_item(1).unwrap().extract().unwrap();
+            let third: OrderStatusReport = results.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(first, pending);
+            assert_eq!(second, unknown);
+            assert_eq!(third, unknown);
+            assert_eq!(first.raw_order_status.as_deref(), Some("PendingSubmit"));
+            assert_eq!(
+                second.raw_order_status.as_deref(),
+                Some("SomeFutureIbkrStatus")
+            );
+            assert_eq!(first.quantity, pending.quantity);
+            assert_eq!(first.filled_qty, pending.filled_qty);
+            assert_eq!(first.avg_px, pending.avg_px);
+            assert_eq!(first.report_id, pending.report_id);
+            assert_eq!(first.ts_accepted, pending.ts_accepted);
+            assert_eq!(first.ts_last, pending.ts_last);
+            assert_eq!(first.order_status, pending.order_status);
+
+            get_message_bus().borrow_mut().dispose();
+        });
+    }
+
+    #[rstest]
+    fn test_python_callback_exception_is_contained_for_order_status_report() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            get_message_bus().borrow_mut().dispose();
+
+            let (handler, globals) = capturing_python_handler(
+                py,
+                "results = []\ndef handler(x):\n    results.append(x)\n    raise RuntimeError('boom')",
+            );
+            let shareable = TypedHandler(Rc::new(handler) as Rc<dyn Handler<dyn Any>>);
+            let topic =
+                crate::msgbus::MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+            msgbus_api::subscribe_any(topic.into(), shareable, None);
+
+            let first = rust_order_status_report("PendingSubmit");
+            let second = rust_order_status_report("Submitted");
+            msgbus_api::publish_any(topic, &first);
+            msgbus_api::publish_any(topic, &second);
+
+            let results = globals.get_item("results").unwrap().unwrap();
+            assert_eq!(
+                results.len().unwrap(),
+                2,
+                "callback exceptions must remain contained so later deliveries still occur"
+            );
+            let received_first: OrderStatusReport = results.get_item(0).unwrap().extract().unwrap();
+            let received_second: OrderStatusReport =
+                results.get_item(1).unwrap().extract().unwrap();
+            assert_eq!(received_first, first);
+            assert_eq!(received_second, second);
+
+            get_message_bus().borrow_mut().dispose();
+        });
+    }
+
+    #[rstest]
+    fn test_py_callable_handler_still_rejects_unbridged_rust_types() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let (handler, globals) =
+                capturing_python_handler(py, "results = []\ndef handler(x): results.append(x)");
+            handler.handle(&42_i32);
+            let results = globals.get_item("results").unwrap().unwrap();
+            assert_eq!(results.len().unwrap(), 0);
+        });
+    }
+
+    #[rstest]
+    fn test_rust_publish_reaches_existing_c2_8_handler() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            get_message_bus().borrow_mut().dispose();
+
+            let sys = py.import("sys").unwrap();
+            let path = sys.getattr("path").unwrap();
+            path.call_method1("insert", (0, "/home/agent/projects/nautilus-extensions"))
+                .unwrap();
+
+            let setup = CString::new(
+                r#"
+import tempfile
+from decimal import Decimal as D
+from pathlib import Path
+
+from nautilus_extensions.account_state import AccountStateFacts
+from nautilus_extensions.admission_coordinator import AdmissionCoordinator
+from nautilus_extensions.admission_store import AdmissionStore, STATE_SUBMITTED
+from nautilus_extensions.broker_state_translator import UNKNOWN_RAW_BROKER_STATUS
+from nautilus_extensions.order_status_delivery import (
+    RECONCILIATION_RAW_ORDER_STATUS_REPORT_TOPIC,
+    NautilusOrderStatusReportHandler,
+)
+from nautilus_extensions.risk import (
+    STANDARD_DRAWDOWN_LADDER,
+    DecisionStatus,
+    RiskEffect,
+    RiskPolicy,
+    Side,
+    TradeIntent,
+)
+
+ACCOUNT = "IB-DU1234567"
+ORDER_ID = "o-1"
+CLIENT = "O-C2-8-001"
+INST = "BTC/USD.PAXOS"
+TOPIC = RECONCILIATION_RAW_ORDER_STATUS_REPORT_TOPIC
+tmp = tempfile.TemporaryDirectory()
+path = str(Path(tmp.name) / "ledger.sqlite")
+store = AdmissionStore(path, ACCOUNT, busy_timeout_ms=1000)
+coord = AdmissionCoordinator(store)
+policy = RiskPolicy(
+    policy_id="pol-1", policy_version="1",
+    max_loss_per_trade=D("10000"), safety_reserve=D("0"),
+    max_instrument_exposure=None, max_portfolio_gross_exposure=None,
+    max_daily_realised_loss=None,
+    drawdown_ladder=STANDARD_DRAWDOWN_LADDER)
+intent = TradeIntent(
+    intent_id="i-1", instrument_id=INST, side=Side.LONG,
+    quantity=D("100"), reference_price=D("100"),
+    risk_effect=RiskEffect.INCREASING, strategy_id="strat-a",
+    strategy_version="1", stop_price=D("99"), per_unit_max_loss=None)
+facts = AccountStateFacts(
+    snapshot_id="snap-1", nav=D("1000000"),
+    cash_settled=D("150000"), high_water_nav=D("1000000"),
+    daily_realised_loss=D("0"), risk_state=None,
+    positions=(), pending_reservations=())
+result = coord.admit(intent, facts, 1, policy)
+assert result.decision.status in (DecisionStatus.APPROVE, DecisionStatus.RESIZE)
+coord.bind_order(ACCOUNT, ORDER_ID, "i-1", client_order_id=CLIENT)
+coord.begin_submission(ACCOUNT, ORDER_ID, "s-1")
+results = []
+handler = NautilusOrderStatusReportHandler(coord, result_sink=results.append)
+"#,
+            )
+            .unwrap();
+
+            let main = py.import("__main__").unwrap();
+            let globals = main.dict();
+            py.run(setup.as_c_str(), Some(&globals), None).unwrap();
+
+            let handler_obj = globals.get_item("handler").unwrap().unwrap().unbind();
+            let topic_str: String = globals
+                .get_item("TOPIC")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(topic_str, "reconciliation.raw.OrderStatusReport");
+
+            let bus = PyMessageBus::py_new(
+                py,
+                TraderId::from("TRADER-001"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            bus.py_subscribe(py, &topic_str, handler_obj, 0).unwrap();
+
+            let pending = {
+                let mut report = rust_order_status_report("PendingSubmit");
+                report.client_order_id = Some(ClientOrderId::from("O-C2-8-001"));
+                report.venue_order_id = VenueOrderId::from("B-C2-8-001");
+                report
+            };
+            let unknown = {
+                let mut report = rust_order_status_report("SomeFutureIbkrStatus");
+                report.client_order_id = Some(ClientOrderId::from("O-C2-8-001"));
+                report.venue_order_id = VenueOrderId::from("B-C2-8-001");
+                report
+            };
+            let topic =
+                crate::msgbus::MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+            msgbus_api::publish_any(topic, &pending);
+            msgbus_api::publish_any(topic, &unknown);
+
+            let results = globals.get_item("results").unwrap().unwrap();
+            assert_eq!(results.len().unwrap(), 2);
+
+            let pending_result = results.get_item(0).unwrap();
+            assert!(
+                pending_result
+                    .getattr("accepted")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert_eq!(
+                pending_result
+                    .getattr("order_id")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "o-1"
+            );
+            assert_eq!(
+                pending_result
+                    .getattr("order_state")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "SUBMITTED"
+            );
+            assert!(
+                pending_result
+                    .getattr("mutation_occurred")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+
+            let unknown_result = results.get_item(1).unwrap();
+            assert!(
+                !unknown_result
+                    .getattr("accepted")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert_eq!(
+                unknown_result
+                    .getattr("reason_code")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "UNKNOWN_RAW_BROKER_STATUS"
+            );
+            let unknown_message: String = unknown_result
+                .getattr("reason_message")
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(
+                unknown_message.contains("SomeFutureIbkrStatus"),
+                "unknown raw status must survive the bridge: {unknown_message}"
+            );
+            assert!(
+                !unknown_result
+                    .getattr("mutation_occurred")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+
+            get_message_bus().borrow_mut().dispose();
         });
     }
 }
