@@ -17,8 +17,9 @@
 
 use std::str::FromStr;
 
+use ahash::AHashMap;
 use anyhow::Context;
-use ibapi::orders::{Execution, OrderStatus};
+use ibapi::orders::{Execution, OrderData, OrderStatus};
 use jiff::{
     Timestamp,
     civil::DateTime,
@@ -42,6 +43,7 @@ use crate::{
         enums::{IbAction, IbOrderStatus, IbOrderType, IbTimeInForce},
         parse::is_spread_instrument_id,
     },
+    execution::account::raw_ib_account_code,
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
 
@@ -300,6 +302,314 @@ pub fn parse_order_status_to_report(
     }
 
     Ok(report)
+}
+
+/// Returns the broker `perm_id` when it is a usable venue identity.
+///
+/// A broker `perm_id` is authoritative only when it is **strictly positive**.
+/// IBKR reports `perm_id == 0` for an order the broker has not yet acknowledged,
+/// in which case the only venue identifier available is the API order id and no
+/// broker venue identity exists. A non-positive value (including a negative
+/// sentinel such as `-1`) is not valid broker venue identity either: it must
+/// never become a `PERM-{perm_id}` venue id or be treated as strong identity by
+/// the reconciliation merge. Callers must carry this distinction explicitly
+/// rather than parse venue-id strings later.
+#[must_use]
+pub fn broker_perm_id(perm_id: i64) -> Option<i64> {
+    (perm_id > 0).then_some(perm_id)
+}
+
+/// A single IBKR order observation bound for one reconciliation snapshot.
+///
+/// The open-order and completed-order sources do not always expose the same
+/// identity strength: an open-order record can arrive without a usable broker
+/// `perm_id`, so its Nautilus `venue_order_id` is only the API order-id
+/// fallback. The tag travels with the report so distinct orders are never
+/// collapsed on a venue id that does not represent broker venue identity.
+#[derive(Clone, Debug)]
+pub struct OrderReportObservation {
+    /// The report to publish on the existing reconciliation seam.
+    pub report: OrderStatusReport,
+    /// Strictly positive broker `perm_id` the report's venue identity was
+    /// derived from, or `None` when no authoritative broker venue identity was
+    /// available (zero, negative, or absent) and only the API order-id fallback
+    /// exists.
+    pub broker_perm_id: Option<i64>,
+}
+
+/// Parse an IBKR completed-order record into a Nautilus [`OrderStatusReport`].
+///
+/// Completed-order records are the broker's explicit record of orders which
+/// have left the open-order book. They are the only IBKR source that reports
+/// terminal cancellation or completion, so they are the evidence used to turn a
+/// completed or cancelled broker order into an `OrderStatusReport`.
+///
+/// Every identity in the produced report comes from broker evidence:
+///
+/// * `venue_order_id` is derived from a strictly positive broker `perm_id`
+///   (`PERM-{perm_id}`). A zero or negative `perm_id` is not authoritative venue
+///   identity and is rejected;
+/// * `client_order_id` is the normalized client `order_ref`;
+/// * `account_id` is the configured Nautilus account identity, accepted only
+///   when the record's broker account matches it exactly.
+///
+/// # Errors
+///
+/// Returns an error when the record cannot support a safe reconciliation report.
+/// The caller must then skip the record; it must not invent the missing data:
+///
+/// * the record carries no strictly positive broker `perm_id`, so no
+///   authoritative venue identity exists and no venue id is synthesized;
+/// * the record carries no broker account, so its account provenance is unknown;
+/// * the record's broker account is not the configured account;
+/// * the record carries no usable client `order_ref`, so the report could not
+///   carry the `client_order_id` the reconciliation seam binds downstream state
+///   through;
+/// * the raw broker status is outside the mapped IBKR vocabulary. A completed
+///   record whose status cannot be classified must not be published with a
+///   defaulted non-terminal status, and must not be guessed into a terminal
+///   one;
+/// * the raw broker status is a known *non-terminal* status. The completed-order
+///   source is terminal broker evidence, so a working state reported by it is
+///   contradictory and is not promoted into terminal authority.
+pub fn parse_completed_order_to_report(
+    order_data: &OrderData,
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    instrument_provider: &InteractiveBrokersInstrumentProvider,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderStatusReport> {
+    let order = &order_data.order;
+
+    // Venue identity must originate from broker evidence. A completed record
+    // carries no live API order id (`order_data.order_id` is the legacy `-1`
+    // sentinel), so `perm_id` is the only broker identity available; refuse the
+    // record rather than fabricate one. Only a strictly positive broker `perm_id`
+    // is authoritative: zero means IBKR has not acknowledged the order, and a
+    // non-positive value is invalid broker identity that must never become a
+    // `PERM-{perm_id}` venue id or be reported as terminal broker evidence.
+    anyhow::ensure!(
+        broker_perm_id(order.perm_id).is_some(),
+        "IBKR completed order perm_id {} is not a positive broker venue identity; refusing to fabricate a venue order id",
+        order.perm_id,
+    );
+
+    // Account provenance must also be broker evidence: an absent or foreign
+    // broker account must never be silently attributed to the locally
+    // configured Nautilus account.
+    anyhow::ensure!(
+        !order.account.is_empty(),
+        "IBKR completed order carries no broker account; refusing to attribute it to the configured Nautilus account",
+    );
+    anyhow::ensure!(
+        order.account == raw_ib_account_code(&account_id),
+        "IBKR completed order does not belong to the configured Nautilus account",
+    );
+
+    // The reconciliation seam binds downstream state through `client_order_id`,
+    // so a completed record without usable client order identity must not
+    // produce a report. No local OMS identity, API order id, or `perm_id` is
+    // substituted for it.
+    anyhow::ensure!(
+        normalized_order_ref(&order.order_ref).is_some_and(|value| !value.is_empty()),
+        "IBKR completed order carries no usable client order_ref; refusing to publish a terminal report without client order identity",
+    );
+
+    let raw_order_status = order_data.order_state.status.as_str();
+
+    // `parse_order_status_to_report` defaults an unrecognized raw status to
+    // SUBMITTED. That is tolerable for a working order whose vocabulary has
+    // moved on, but for a completed record it would publish fabricated
+    // non-terminal broker truth. Fail closed instead.
+    let ib_status = IbOrderStatus::from_str(raw_order_status).with_context(|| {
+        format!(
+            "IBKR completed order perm_id {} has an unmappable raw status '{raw_order_status}'",
+            order.perm_id,
+        )
+    })?;
+
+    // Completed orders are terminal broker evidence only. A known non-terminal
+    // status on a completed record is contradictory broker evidence and must not
+    // be promoted into terminal authority for this snapshot.
+    anyhow::ensure!(
+        ib_status.is_terminal(),
+        "IBKR completed order perm_id {} reports the non-terminal status '{raw_order_status}'; the completed-order source accepts terminal evidence only",
+        order.perm_id,
+    );
+
+    let mut report = parse_order_status_to_report(
+        &OrderStatus {
+            order_id: order_data.order_id,
+            status: order_data.order_state.status.clone(),
+            filled: order.filled_quantity,
+            remaining: (order.total_quantity - order.filled_quantity).max(0.0),
+            average_fill_price: None,
+            perm_id: order.perm_id,
+            parent_id: order.parent_id,
+            last_fill_price: None,
+            client_id: order.client_id,
+            why_held: String::new(),
+            market_cap_price: None,
+        },
+        Some(order),
+        instrument_id,
+        account_id,
+        instrument_provider,
+        ts_init,
+    )?;
+
+    // The record is terminal by construction, so the mapped broker status is
+    // authoritative over the working-order partial-fill promotion: an order
+    // cancelled after a partial fill is terminal at the broker, not still
+    // working.
+    report.order_status = ib_status.nautilus_status();
+
+    anyhow::ensure!(
+        report.client_order_id.is_some(),
+        "IBKR completed order produced a report without client order identity",
+    );
+
+    Ok(report)
+}
+
+/// Whether an incoming observation supersedes one already merged for the same
+/// logical broker order.
+///
+/// Deterministic precedence:
+///
+/// 1. stronger broker venue identity replaces the API order-id fallback;
+/// 2. terminal broker evidence replaces a non-terminal observation;
+/// 3. between two terminal observations that both carry broker venue identity,
+///    the later (completed-order) observation wins - it is the explicit terminal
+///    authority.
+///
+/// A terminal observation that carries only the API order-id fallback never
+/// replaces a broker-identified observation, so a weaker identity can never
+/// displace real broker venue identity.
+fn supersedes(incoming: &OrderReportObservation, existing: &OrderReportObservation) -> bool {
+    let stronger_venue_identity =
+        incoming.broker_perm_id.is_some() && existing.broker_perm_id.is_none();
+    let terminal_evidence =
+        incoming.report.order_status.is_closed() && !existing.report.order_status.is_closed();
+    let explicit_terminal_authority = incoming.report.order_status.is_closed()
+        && existing.report.order_status.is_closed()
+        && incoming.broker_perm_id.is_some()
+        && existing.broker_perm_id.is_some();
+
+    stronger_venue_identity || terminal_evidence || explicit_terminal_authority
+}
+
+/// Merge open-order and completed-order observations into one deterministic
+/// reconciliation snapshot.
+///
+/// IBKR can report the same logical order from both `reqAllOpenOrders` and
+/// `reqCompletedOrders` inside one reconciliation window: an order that
+/// completes between the two requests is still returned by the open-order
+/// snapshot. Two overlapping observations can disagree about venue identity,
+/// because IBKR reports `perm_id == 0` until it acknowledges an order, so an
+/// open-order observation may carry only the API order-id fallback while the
+/// completed-order observation for the same order carries a real `perm_id`.
+/// Only a strictly positive `perm_id` counts as broker venue identity, so a
+/// zero or negative value is tagged as the fallback rather than as strong
+/// identity.
+///
+/// Correlation uses only fields that both sources actually share and that are
+/// unique to the logical order:
+///
+/// * primary key: the Nautilus venue identity ([`VenueOrderId`]) already derived
+///   by the crate-private `ib_venue_order_id` helper from the broker `perm_id`;
+/// * fallback: the `client_order_id` derived from the broker `order_ref`, used
+///   **only** while exactly one of the two observations lacks broker venue
+///   identity. Two observations that both carry a strictly positive broker
+///   `perm_id` are never merged on client identity, so unrelated broker orders
+///   cannot be collapsed.
+///
+/// Fields deliberately not used for correlation: the API client id and the
+/// broker account (both are shared by every order of the session, so they cannot
+/// identify an order), the live API order id (absent from completed records),
+/// and instrument, price or quantity (not identity evidence at all).
+///
+/// Output ordering is deterministic: open-order observations keep their source
+/// position (a replacement overwrites in place) and completed-only observations
+/// are appended in broker arrival order. At most one report is emitted per
+/// correlated logical order, so one snapshot cannot carry contradictory status
+/// reports for the same broker order.
+#[must_use]
+pub fn merge_order_status_reports(
+    open_observations: Vec<OrderReportObservation>,
+    completed_observations: Vec<OrderReportObservation>,
+) -> Vec<OrderStatusReport> {
+    let mut merged: Vec<OrderReportObservation> =
+        Vec::with_capacity(open_observations.len() + completed_observations.len());
+    let mut index_by_venue: AHashMap<VenueOrderId, usize> = AHashMap::new();
+    let mut index_by_client: AHashMap<ClientOrderId, usize> = AHashMap::new();
+
+    for observation in open_observations.into_iter().chain(completed_observations) {
+        let venue_order_id = observation.report.venue_order_id;
+        let client_order_id = observation.report.client_order_id;
+
+        let by_venue = index_by_venue.get(&venue_order_id).copied();
+        let by_client = client_order_id.and_then(|id| index_by_client.get(&id).copied());
+
+        let target = match (by_venue, by_client) {
+            (Some(index), _) => Some(index),
+            (None, Some(index)) => {
+                // Venue-identity transition: correlate on the shared client
+                // order identity only while exactly one observation lacks broker
+                // venue identity.
+                let existing = &merged[index];
+                (existing.broker_perm_id.is_none() != observation.broker_perm_id.is_none())
+                    .then_some(index)
+            }
+            (None, None) => None,
+        };
+
+        match target {
+            Some(index) => {
+                if !supersedes(&observation, &merged[index]) {
+                    continue;
+                }
+
+                let previous = &merged[index];
+
+                if previous.report.venue_order_id != venue_order_id {
+                    index_by_venue.remove(&previous.report.venue_order_id);
+                }
+
+                if let Some(previous_client_id) = previous.report.client_order_id {
+                    if Some(previous_client_id) != client_order_id
+                        && index_by_client.get(&previous_client_id) == Some(&index)
+                    {
+                        index_by_client.remove(&previous_client_id);
+                    }
+                }
+
+                index_by_venue.insert(venue_order_id, index);
+
+                if let Some(client_order_id) = client_order_id {
+                    index_by_client.entry(client_order_id).or_insert(index);
+                }
+
+                merged[index] = observation;
+            }
+            None => {
+                index_by_venue.insert(venue_order_id, merged.len());
+
+                if let Some(client_order_id) = client_order_id {
+                    index_by_client
+                        .entry(client_order_id)
+                        .or_insert(merged.len());
+                }
+
+                merged.push(observation);
+            }
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|observation| observation.report)
+        .collect()
 }
 
 fn map_ib_order_type(order_type: &str, limit_price: Option<f64>) -> OrderType {
@@ -1295,5 +1605,674 @@ mod tests {
                 assert_eq!(fill.order_side, OrderSide::Sell);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod completed_order_report_tests {
+    use ibapi::{
+        contracts::Contract,
+        orders::{Action, Order, OrderData, OrderState, OrderStatusKind},
+    };
+    use nautilus_model::identifiers::{Symbol, Venue};
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        config::InteractiveBrokersInstrumentProviderConfig,
+        providers::instruments::InteractiveBrokersInstrumentProvider,
+    };
+
+    const PERM_ID: i64 = 1377295418;
+    const OTHER_PERM_ID: i64 = 1377295419;
+    const CLIENT_ORDER_REF: &str = "O-C2-10P1-001";
+    const OTHER_CLIENT_ORDER_REF: &str = "O-C2-10P1-002";
+    const BROKER_ACCOUNT: &str = "DU1234567";
+    const FOREIGN_BROKER_ACCOUNT: &str = "DU7654321";
+    const TS_INIT: u64 = 1_756_000_000_000_000_000;
+
+    fn instrument_provider() -> InteractiveBrokersInstrumentProvider {
+        InteractiveBrokersInstrumentProvider::new(
+            InteractiveBrokersInstrumentProviderConfig::default(),
+        )
+    }
+
+    fn instrument_id() -> InstrumentId {
+        InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ"))
+    }
+
+    fn account_id() -> AccountId {
+        AccountId::new("IB-DU1234567")
+    }
+
+    fn ts_init() -> UnixNanos {
+        UnixNanos::from(TS_INIT)
+    }
+
+    fn order_with(perm_id: i64, filled_qty: f64, order_ref: &str, account: &str) -> Order {
+        Order {
+            order_id: 7,
+            client_id: 1,
+            perm_id,
+            action: Action::Buy,
+            total_quantity: 100.0,
+            filled_quantity: filled_qty,
+            order_type: "LMT".to_string(),
+            limit_price: Some(25.0),
+            account: account.to_string(),
+            order_ref: order_ref.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Mirrors how the vendored IB client decodes a `CompletedOrder` response:
+    /// no live API order id (legacy `-1` sentinel) and the status carried on the
+    /// order state.
+    fn completed_order_data(status: OrderStatusKind, filled_qty: f64, perm_id: i64) -> OrderData {
+        completed_order_data_with(
+            status,
+            filled_qty,
+            perm_id,
+            CLIENT_ORDER_REF,
+            BROKER_ACCOUNT,
+        )
+    }
+
+    fn completed_order_data_with(
+        status: OrderStatusKind,
+        filled_qty: f64,
+        perm_id: i64,
+        order_ref: &str,
+        account: &str,
+    ) -> OrderData {
+        let order_state = OrderState {
+            status,
+            completed_status: "Cancelled by Trader".to_string(),
+            completed_time: "20260910 15:30:00 America/New_York".to_string(),
+            ..Default::default()
+        };
+
+        OrderData {
+            order_id: -1,
+            contract: Contract::default(),
+            order: order_with(perm_id, filled_qty, order_ref, account),
+            order_state,
+        }
+    }
+
+    fn convert(data: &OrderData) -> anyhow::Result<OrderStatusReport> {
+        parse_completed_order_to_report(
+            data,
+            instrument_id(),
+            account_id(),
+            &instrument_provider(),
+            ts_init(),
+        )
+    }
+
+    fn observation(report: OrderStatusReport, perm_id: i64) -> OrderReportObservation {
+        OrderReportObservation {
+            report,
+            broker_perm_id: broker_perm_id(perm_id),
+        }
+    }
+
+    fn open_order_report(
+        status: OrderStatusKind,
+        perm_id: i64,
+        filled: f64,
+        remaining: f64,
+    ) -> OrderStatusReport {
+        parse_order_status_to_report(
+            &OrderStatus {
+                order_id: 7,
+                status,
+                filled,
+                remaining,
+                average_fill_price: None,
+                perm_id,
+                parent_id: 0,
+                last_fill_price: None,
+                client_id: 1,
+                why_held: String::new(),
+                market_cap_price: None,
+            },
+            Some(&order_with(
+                perm_id,
+                filled,
+                CLIENT_ORDER_REF,
+                BROKER_ACCOUNT,
+            )),
+            instrument_id(),
+            account_id(),
+            &instrument_provider(),
+            ts_init(),
+        )
+        .unwrap()
+    }
+
+    fn venue_order_id(perm_id: i64) -> VenueOrderId {
+        VenueOrderId::new(format!("PERM-{perm_id}"))
+    }
+
+    // --------------------------------------------------------------------- //
+    // Completed record -> report (identity, account, status)
+    // --------------------------------------------------------------------- //
+
+    #[rstest]
+    fn test_completed_cancelled_record_becomes_order_status_report() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.order_status, NautilusOrderStatus::Canceled);
+        assert_eq!(report.quantity.as_f64(), 100.0);
+        assert_eq!(report.filled_qty.as_f64(), 0.0);
+    }
+
+    #[rstest]
+    fn test_completed_api_cancelled_record_maps_to_canceled() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::ApiCancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.order_status, NautilusOrderStatus::Canceled);
+    }
+
+    #[rstest]
+    fn test_completed_filled_record_maps_to_filled() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Filled,
+            100.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.order_status, NautilusOrderStatus::Filled);
+        assert_eq!(report.filled_qty.as_f64(), 100.0);
+    }
+
+    #[rstest]
+    fn test_completed_inactive_record_maps_to_rejected() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Inactive,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.order_status, NautilusOrderStatus::Rejected);
+    }
+
+    #[rstest]
+    #[case(OrderStatusKind::Submitted)]
+    #[case(OrderStatusKind::PreSubmitted)]
+    #[case(OrderStatusKind::PendingCancel)]
+    #[case(OrderStatusKind::PendingSubmit)]
+    #[case(OrderStatusKind::ApiPending)]
+    fn test_completed_non_terminal_status_fails_closed(#[case] status: OrderStatusKind) {
+        let data = completed_order_data(status, 0.0, PERM_ID);
+
+        assert!(convert(&data).is_err());
+    }
+
+    #[rstest]
+    fn test_completed_unknown_raw_status_fails_closed() {
+        let data = completed_order_data(
+            OrderStatusKind::Unknown("SomeFutureIbkrStatus".into()),
+            0.0,
+            PERM_ID,
+        );
+
+        let error = convert(&data).unwrap_err();
+
+        assert!(error.to_string().contains("SomeFutureIbkrStatus"));
+    }
+
+    #[rstest]
+    fn test_cancelled_partial_fill_remains_terminal() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            40.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.order_status, NautilusOrderStatus::Canceled);
+        assert_eq!(report.filled_qty.as_f64(), 40.0);
+    }
+
+    #[rstest]
+    fn test_completed_order_venue_order_id_originates_from_broker_perm_id() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            OTHER_PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.venue_order_id, venue_order_id(OTHER_PERM_ID));
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(PERM_ID)]
+    #[case(i64::MAX)]
+    fn test_positive_perm_id_maps_to_perm_venue_order_id(#[case] perm_id: i64) {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            perm_id,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            report.venue_order_id,
+            VenueOrderId::new(format!("PERM-{perm_id}"))
+        );
+    }
+
+    #[rstest]
+    fn test_broker_perm_id_accepts_only_strictly_positive_values() {
+        assert_eq!(broker_perm_id(PERM_ID), Some(PERM_ID));
+        assert_eq!(broker_perm_id(1), Some(1));
+        assert_eq!(broker_perm_id(i64::MAX), Some(i64::MAX));
+
+        assert_eq!(broker_perm_id(0), None);
+        assert_eq!(broker_perm_id(-1), None);
+        assert_eq!(broker_perm_id(-2), None);
+        assert_eq!(broker_perm_id(i64::MIN), None);
+    }
+
+    #[rstest]
+    fn test_completed_order_without_perm_id_fails_closed() {
+        let data = completed_order_data(OrderStatusKind::Cancelled, 0.0, 0);
+
+        assert!(convert(&data).is_err());
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(-1)]
+    #[case(-2)]
+    #[case(i64::MIN)]
+    fn test_completed_non_positive_perm_id_fails_closed(#[case] perm_id: i64) {
+        let data = completed_order_data(OrderStatusKind::Cancelled, 0.0, perm_id);
+
+        let error = convert(&data).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("is not a positive broker venue identity"),
+            "the fail-closed error must name the invalid broker venue identity: {error}"
+        );
+    }
+
+    #[rstest]
+    fn test_completed_order_preserves_client_order_id() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::new(CLIENT_ORDER_REF))
+        );
+    }
+
+    #[rstest]
+    fn test_completed_order_client_order_id_ignores_strategy_suffix() {
+        let data = completed_order_data_with(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+            "O-C2-10P1-001:leg-1",
+            BROKER_ACCOUNT,
+        );
+
+        let report = convert(&data).unwrap();
+
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::new(CLIENT_ORDER_REF))
+        );
+    }
+
+    #[rstest]
+    fn test_completed_order_with_empty_order_ref_fails_closed() {
+        let data =
+            completed_order_data_with(OrderStatusKind::Cancelled, 0.0, PERM_ID, "", BROKER_ACCOUNT);
+
+        assert!(convert(&data).is_err());
+    }
+
+    #[rstest]
+    fn test_completed_order_with_unusable_order_ref_fails_closed() {
+        // Normalizing `":"` yields an empty base id; the record must be
+        // rejected rather than panicking or emitting an empty client identity.
+        let data = completed_order_data_with(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+            ":",
+            BROKER_ACCOUNT,
+        );
+
+        assert!(convert(&data).is_err());
+    }
+
+    #[rstest]
+    fn test_completed_order_with_matching_broker_account_is_accepted() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.account_id, account_id());
+        assert_eq!(report.instrument_id, instrument_id());
+    }
+
+    #[rstest]
+    fn test_completed_order_with_empty_broker_account_fails_closed() {
+        let data = completed_order_data_with(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+            CLIENT_ORDER_REF,
+            "",
+        );
+
+        assert!(convert(&data).is_err());
+    }
+
+    #[rstest]
+    fn test_completed_order_with_foreign_broker_account_fails_closed() {
+        let data = completed_order_data_with(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+            CLIENT_ORDER_REF,
+            FOREIGN_BROKER_ACCOUNT,
+        );
+
+        assert!(convert(&data).is_err());
+    }
+
+    #[rstest]
+    fn test_completed_order_preserves_raw_order_status() {
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.raw_order_status.as_deref(), Some("Cancelled"));
+    }
+
+    // --------------------------------------------------------------------- //
+    // Open + completed merge (overlap, venue-identity transition)
+    // --------------------------------------------------------------------- //
+
+    #[rstest]
+    fn test_empty_completed_response_preserves_open_order_reports() {
+        let open = open_order_report(OrderStatusKind::Submitted, PERM_ID, 0.0, 100.0);
+
+        let merged =
+            merge_order_status_reports(vec![observation(open.clone(), PERM_ID)], Vec::new());
+
+        assert_eq!(merged, vec![open]);
+    }
+
+    #[rstest]
+    fn test_overlap_with_shared_perm_id_yields_one_completed_observation() {
+        let open = open_order_report(OrderStatusKind::Submitted, PERM_ID, 0.0, 100.0);
+        let completed = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        let merged = merge_order_status_reports(
+            vec![observation(open, PERM_ID)],
+            vec![observation(completed, PERM_ID)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].order_status, NautilusOrderStatus::Canceled);
+        assert_eq!(merged[0].venue_order_id, venue_order_id(PERM_ID));
+        assert_eq!(
+            merged[0].client_order_id,
+            Some(ClientOrderId::new(CLIENT_ORDER_REF))
+        );
+    }
+
+    #[rstest]
+    fn test_overlap_precedence_and_ordering_are_deterministic() {
+        let open = open_order_report(OrderStatusKind::Submitted, PERM_ID, 0.0, 100.0);
+        let completed = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        let first = merge_order_status_reports(
+            vec![observation(open.clone(), PERM_ID)],
+            vec![observation(completed.clone(), PERM_ID)],
+        );
+        let second = merge_order_status_reports(
+            vec![observation(open, PERM_ID)],
+            vec![observation(completed, PERM_ID)],
+        );
+
+        assert_eq!(first, second);
+    }
+
+    #[rstest]
+    fn test_venue_identity_transition_yields_one_completed_observation() {
+        // The open observation has no broker venue identity (IBKR reports
+        // perm_id == 0 until it acknowledges the order), so its venue order id is
+        // only the API order-id fallback; the same order then appears completed
+        // with a positive perm_id.
+        let open = open_order_report(OrderStatusKind::Submitted, 0, 0.0, 100.0);
+        assert_eq!(open.venue_order_id, VenueOrderId::new("7"));
+
+        let completed = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        let merged = merge_order_status_reports(
+            vec![observation(open, 0)],
+            vec![observation(completed, PERM_ID)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].order_status, NautilusOrderStatus::Canceled);
+        assert_eq!(merged[0].venue_order_id, venue_order_id(PERM_ID));
+        assert_eq!(
+            merged[0].client_order_id,
+            Some(ClientOrderId::new(CLIENT_ORDER_REF))
+        );
+    }
+
+    #[rstest]
+    fn test_non_positive_perm_id_is_not_authoritative_broker_venue_identity() {
+        // A negative perm_id is invalid broker identity, so the observation holds
+        // no authoritative venue identity and the correlated completed
+        // observation replaces it with the real broker identity.
+        let open = open_order_report(OrderStatusKind::Submitted, -1, 0.0, 100.0);
+        assert_eq!(observation(open.clone(), -1).broker_perm_id, None);
+        assert_eq!(observation(open.clone(), 0).broker_perm_id, None);
+
+        let completed = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        let merged = merge_order_status_reports(
+            vec![observation(open, -1)],
+            vec![observation(completed, PERM_ID)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].order_status, NautilusOrderStatus::Canceled);
+        assert_eq!(merged[0].venue_order_id, venue_order_id(PERM_ID));
+    }
+
+    #[rstest]
+    fn test_terminal_open_fallback_observation_is_upgraded_to_broker_venue_identity() {
+        let open = open_order_report(OrderStatusKind::Filled, 0, 100.0, 0.0);
+        assert_eq!(open.order_status, NautilusOrderStatus::Filled);
+        assert_eq!(open.venue_order_id, VenueOrderId::new("7"));
+
+        let completed = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        let merged = merge_order_status_reports(
+            vec![observation(open, 0)],
+            vec![observation(completed, PERM_ID)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].order_status, NautilusOrderStatus::Canceled);
+        assert_eq!(merged[0].venue_order_id, venue_order_id(PERM_ID));
+    }
+
+    #[rstest]
+    fn test_venue_identity_transition_does_not_collapse_unrelated_orders() {
+        // Same instrument, side, quantity and price as the completed record, but
+        // a different client order identity: these are unrelated orders.
+        let open = open_order_report(OrderStatusKind::Submitted, 0, 0.0, 100.0);
+        let completed = convert(&completed_order_data_with(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+            OTHER_CLIENT_ORDER_REF,
+            BROKER_ACCOUNT,
+        ))
+        .unwrap();
+
+        let merged = merge_order_status_reports(
+            vec![observation(open, 0)],
+            vec![observation(completed, PERM_ID)],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].client_order_id,
+            Some(ClientOrderId::new(CLIENT_ORDER_REF))
+        );
+        assert_eq!(
+            merged[1].client_order_id,
+            Some(ClientOrderId::new(OTHER_CLIENT_ORDER_REF))
+        );
+    }
+
+    #[rstest]
+    fn test_broker_identified_orders_are_not_collapsed_on_shared_client_identity() {
+        // Two distinct broker venue orders sharing one client order identity are
+        // kept distinct: collapsing them would hide a real broker order.
+        let first = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+        let second = convert(&completed_order_data(
+            OrderStatusKind::Filled,
+            100.0,
+            OTHER_PERM_ID,
+        ))
+        .unwrap();
+
+        let merged = merge_order_status_reports(
+            Vec::new(),
+            vec![
+                observation(first, PERM_ID),
+                observation(second, OTHER_PERM_ID),
+            ],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].venue_order_id, venue_order_id(PERM_ID));
+        assert_eq!(merged[1].venue_order_id, venue_order_id(OTHER_PERM_ID));
+    }
+
+    #[rstest]
+    fn test_distinct_broker_orders_with_similar_attributes_remain_distinct() {
+        let first = convert(&completed_order_data_with(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+            CLIENT_ORDER_REF,
+            BROKER_ACCOUNT,
+        ))
+        .unwrap();
+        let second = convert(&completed_order_data_with(
+            OrderStatusKind::Cancelled,
+            0.0,
+            OTHER_PERM_ID,
+            OTHER_CLIENT_ORDER_REF,
+            BROKER_ACCOUNT,
+        ))
+        .unwrap();
+
+        assert_eq!(first.instrument_id, second.instrument_id);
+        assert_eq!(first.quantity, second.quantity);
+
+        let merged = merge_order_status_reports(
+            Vec::new(),
+            vec![
+                observation(first, PERM_ID),
+                observation(second, OTHER_PERM_ID),
+            ],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_ne!(merged[0].venue_order_id, merged[1].venue_order_id);
+    }
+
+    #[rstest]
+    fn test_completed_only_observation_appends_after_open_observations() {
+        let open = open_order_report(OrderStatusKind::Submitted, OTHER_PERM_ID, 0.0, 100.0);
+        let completed = convert(&completed_order_data(
+            OrderStatusKind::Cancelled,
+            0.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        let merged = merge_order_status_reports(
+            vec![observation(open.clone(), OTHER_PERM_ID)],
+            vec![observation(completed.clone(), PERM_ID)],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], open);
+        assert_eq!(merged[1], completed);
     }
 }

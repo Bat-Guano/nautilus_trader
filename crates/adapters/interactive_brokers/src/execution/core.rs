@@ -102,7 +102,8 @@ use ustr::Ustr;
 use super::{
     account::{PositionTracker, create_position_tracker, raw_ib_account_code},
     parse::{
-        ib_venue_order_id, parse_execution_time, parse_execution_to_fill_report,
+        OrderReportObservation, broker_perm_id, ib_venue_order_id, merge_order_status_reports,
+        parse_completed_order_to_report, parse_execution_time, parse_execution_to_fill_report,
         parse_order_status_to_report,
     },
     transform::nautilus_order_to_ib_order,
@@ -882,7 +883,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .await
             .context("Timeout requesting open orders")??;
         let mut subscription = subscription.filter_data();
-        let mut reports = Vec::new();
+        let mut open_observations = Vec::new();
         let mut open_order_fills: AHashMap<InstrumentId, Decimal> = AHashMap::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let raw_account_id = raw_ib_account_code(&self.core.account_id);
@@ -953,7 +954,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                                     .and_modify(|qty| *qty += signed_filled)
                                     .or_insert(signed_filled);
                             }
-                            reports.push(report);
+                            open_observations.push(OrderReportObservation {
+                                report,
+                                broker_perm_id: broker_perm_id(data.order.perm_id),
+                            });
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse order status report: {e}");
@@ -968,6 +972,19 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 }
             }
         }
+
+        // Completed orders are the broker's explicit terminal evidence and the only
+        // source that reports orders which have left the open-order book. They are
+        // merged with the open-order observations into one deterministic snapshot;
+        // a failed request contributes no terminal evidence rather than inferred
+        // terminal truth.
+        let completed_observations = if cmd.open_only {
+            Vec::new()
+        } else {
+            self.fetch_completed_order_reports(client, cmd, ts_init)
+                .await
+        };
+        let mut reports = merge_order_status_reports(open_observations, completed_observations);
 
         if !cmd.open_only {
             let positions = tokio::time::timeout(timeout_dur, client.positions())
@@ -2042,6 +2059,103 @@ impl InteractiveBrokersExecutionClient {
         exec_data: &ExecutionData,
     ) -> anyhow::Result<InstrumentId> {
         self.resolve_report_contract_instrument_id(&exec_data.contract)
+    }
+
+    /// Requests IBKR completed orders and converts them into order status reports.
+    ///
+    /// Completed orders are the broker's explicit evidence of terminal state.
+    /// A failed, unsupported, or timed-out request is *not* evidence of
+    /// cancellation: this returns an empty set so the reconciliation snapshot
+    /// keeps only its open-order observations.
+    async fn fetch_completed_order_reports(
+        &self,
+        client: &SharedClientHandle,
+        cmd: &GenerateOrderStatusReports,
+        ts_init: UnixNanos,
+    ) -> Vec<OrderReportObservation> {
+        let timeout_dur = Duration::from_secs(self.config.request_timeout);
+
+        // `api_only = true` requests completed orders for this API client only,
+        // matching the ownership scope of the orders this adapter places.
+        let subscription = match tokio::time::timeout(timeout_dur, client.completed_orders(true))
+            .await
+        {
+            Ok(Ok(subscription)) => subscription,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "Failed to request IBKR completed orders; this snapshot carries no completed-order evidence: {e}"
+                );
+                return Vec::new();
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Timeout requesting IBKR completed orders; this snapshot carries no completed-order evidence"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut completed = subscription.filter_data();
+        let mut observations = Vec::new();
+
+        while let Some(order_result) = completed.next().await {
+            match order_result {
+                Ok(Orders::OrderData(data)) => {
+                    // Account provenance is enforced by the conversion below, which
+                    // rejects an absent or foreign broker account outright.
+
+                    let instrument_id =
+                        match self.resolve_report_contract_instrument_id(&data.contract) {
+                            Ok(instrument_id) => instrument_id,
+                            Err(e) => {
+                                tracing::warn!(
+                                    perm_id = data.order.perm_id,
+                                    sec_type = ?data.contract.security_type,
+                                    symbol = data.contract.symbol.as_str(),
+                                    con_id = data.contract.contract_id,
+                                    error = %e,
+                                    "Failed to resolve IBKR completed-order instrument ID",
+                                );
+                                continue;
+                            }
+                        };
+
+                    if let Some(filter_id) = cmd.instrument_id {
+                        if instrument_id != filter_id {
+                            continue;
+                        }
+                    }
+
+                    match parse_completed_order_to_report(
+                        &data,
+                        instrument_id,
+                        self.core.account_id,
+                        &self.instrument_provider,
+                        ts_init,
+                    ) {
+                        Ok(report) => observations.push(OrderReportObservation {
+                            report,
+                            broker_perm_id: broker_perm_id(data.order.perm_id),
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                perm_id = data.order.perm_id,
+                                error = %e,
+                                "Failed to convert IBKR completed order to an order status report",
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Ignore other order types
+                }
+                Err(e) => {
+                    tracing::warn!("Error receiving completed order data: {e}");
+                }
+            }
+        }
+
+        observations
     }
 
     fn resolve_report_contract_instrument_id(

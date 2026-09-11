@@ -306,6 +306,77 @@ for the supported order attributes.
 | `track_option_exercise_from_position_update` | `False`       | Infer option exercise from position updates.    |
 | `instrument_provider`                        | Default       | Configure contract and instrument loading.      |
 
+### Completed-order reconciliation
+
+`generate_order_status_reports` builds one reconciliation snapshot from two broker sources:
+
+| Source           | IB request           | Covers                                     |
+| ---------------- | -------------------- | ------------------------------------------ |
+| Open orders      | `reqAllOpenOrders`   | Orders still working at the venue.         |
+| Completed orders | `reqCompletedOrders` | Orders that have left the open-order book. |
+
+Open orders alone cannot prove terminal cancellation. Once IBKR cancels or completes an order it
+disappears from the open-order response, so absence from that response is not evidence of a terminal
+state. The adapter therefore also requests completed orders (`api_only = true`, i.e. orders placed by
+this API client) and converts each record with `parse_completed_order_to_report`, producing the same
+`OrderStatusReport` type used by the existing report publication path. No additional reconciliation
+ingress is introduced.
+
+Every identity in a completed-order report must come from broker evidence:
+
+- `venue_order_id` is derived **only** from a strictly positive broker `perm_id` (`PERM-{perm_id}`). A
+  completed record whose `perm_id` is zero or negative is rejected rather than assigned a fabricated venue
+  identity: zero means IBKR has not acknowledged the order yet, and a non-positive value (for example a
+  `-1` sentinel) is not valid broker venue identity. A non-positive `perm_id` is therefore never treated as
+  authoritative identity, never becomes a `PERM-{perm_id}` venue id, and no fallback venue identity is
+  synthesized for a completed record.
+- `account_id` is the configured Nautilus account identity, and the record is accepted **only** when its
+  broker account matches that account exactly. A completed record whose broker account is empty is
+  rejected: an absent broker account is never silently replaced by the local account. A foreign broker
+  account is rejected as well. No report is emitted that invents account provenance.
+- `client_order_id` is the normalized client `order_ref`, preserved exactly so downstream matching still
+  binds to the order this client submitted. A completed record with an empty or otherwise unusable
+  `order_ref` is rejected before publication: `perm_id`, the live API order id and local OMS identity are
+  never substituted for the broker-provided client identity.
+
+Completed-order status handling is terminal-only:
+
+- accepted terminal statuses: `Cancelled`, `ApiCancelled` (both `CANCELED`), `Filled` (`FILLED`),
+  `Inactive` (`REJECTED`);
+- rejected known non-terminal statuses: `ApiPending`, `PendingSubmit`, `PreSubmitted`, `Submitted`,
+  `PendingCancel` - a completed record reporting a working state is contradictory broker evidence and is
+  not promoted into terminal authority;
+- rejected unknown raw statuses: the raw string is unmappable, so no report is produced and nothing is
+  defaulted to a non-terminal status;
+- the raw IBKR status string is preserved in `raw_order_status` for every accepted report;
+- an accepted terminal status is never downgraded to `PartiallyFilled` by the working-order partial-fill
+  rule, so an order cancelled after a partial fill is reported as `CANCELED`.
+
+Overlap and deduplication: IBKR can return the same order from both sources in one window, and the two
+observations can disagree about venue identity, because IBKR reports `perm_id == 0` until it acknowledges
+an order (an open-order observation may therefore carry only the API order-id fallback while the
+completed-order observation for the same order carries a real `perm_id`). Observations are correlated on:
+
+1. the Nautilus venue identity (`VenueOrderId`) derived from the broker `perm_id`; and
+2. only while exactly one of the two observations lacks broker venue identity, the `client_order_id`
+   derived from the broker `order_ref`.
+
+Two observations that both carry a positive broker `perm_id` are never merged on client identity, so
+unrelated broker orders cannot be collapsed merely because one field matches; two distinct broker venue
+orders sharing one client identity are both kept. The API client id and the broker account are not
+correlation keys (every order of the session shares them), and instrument, price or quantity are never
+used. Precedence is deterministic: stronger broker venue identity replaces the API order-id fallback,
+terminal broker evidence replaces a non-terminal observation, and between two broker-identified terminal
+observations the completed-order observation wins. Ordering is deterministic: open-order observations
+keep their source position (a replacement overwrites in place) and completed-only observations are
+appended in broker arrival order, so one snapshot never carries contradictory reports for one correlated
+order.
+
+Fail-closed behavior: if the completed-order request fails, times out, or the connected server does not
+support it, the snapshot carries no completed-order evidence and keeps the open-order observations
+unchanged. A missing completed record is never interpreted as cancellation, and no terminal state is ever
+inferred solely from absence in the open-order response.
+
 ## Troubleshooting
 
 - Confirm TWS or IB Gateway is running and logged in.
