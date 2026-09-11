@@ -524,8 +524,8 @@ mod tests {
 
     #[rstest]
     fn test_order_status_report_with_raw_order_status() {
-        let report = test_order_status_report()
-            .with_raw_order_status("SomeFutureIbkrStatus".to_string());
+        let report =
+            test_order_status_report().with_raw_order_status("SomeFutureIbkrStatus".to_string());
 
         assert_eq!(
             report.raw_order_status.as_deref(),

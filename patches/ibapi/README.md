@@ -1,3 +1,5 @@
+# ibapi
+
 [![Build](https://github.com/wboayue/rust-ibapi/workflows/ci/badge.svg)](https://github.com/wboayue/rust-ibapi/actions/workflows/ci.yml)
 [![License:MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![crates.io](https://img.shields.io/crates/v/ibapi.svg)](https://crates.io/crates/ibapi)
@@ -8,8 +10,8 @@
 
 ## What's new in 3.0
 
-- **Protobuf-only wire format.** v3.0 drops the legacy text protocol and speaks only TWS protobuf. Requires TWS / IB Gateway server version **213 or newer**. Smaller, faster, and version-gated by IB itself — see [`docs/migration-3.0.md`](docs/migration-3.0.md) for the cutover.
-- **API ergonomics overhaul.** Builders for multi-arg subscriptions (`market_data(&contract).subscribe()`, `realtime_bars(&contract).subscribe()`), unified `Subscription<T>` shape with `SubscriptionItem::{Data, Notice}`, typed `OrderStatusKind` (was magic-string `String`), globally-routed `Client::notice_stream()` for unsolicited notices, and consistent sync/async surfaces. See the [migration guide](docs/migration-3.0.md) for the before/after on every breaking change.
+- **Protobuf-only wire format.** v3.0 drops the legacy text protocol and speaks only TWS protobuf. Requires TWS / IB Gateway server version **213 or newer**. Smaller, faster, and version-gated by IB itself — see [`docs/migration-3.0.md`](https://github.com/wboayue/rust-ibapi/blob/b140b312d1136d240f3b5651a89f4778e01aa222/docs/migration-3.0.md) for the cutover.
+- **API ergonomics overhaul.** Builders for multi-arg subscriptions (`market_data(&contract).subscribe()`, `realtime_bars(&contract).subscribe()`), unified `Subscription<T>` shape with `SubscriptionItem::{Data, Notice}`, typed `OrderStatusKind` (was magic-string `String`), globally-routed `Client::notice_stream()` for unsolicited notices, and consistent sync/async surfaces. See the [migration guide](https://github.com/wboayue/rust-ibapi/blob/b140b312d1136d240f3b5651a89f4778e01aa222/docs/migration-3.0.md) for the before/after on every breaking change.
 
 ## Introduction
 
@@ -56,7 +58,7 @@ use ibapi::Client;                    // async client
 use ibapi::client::blocking::Client;  // blocking client
 ```
 
-> **📚 Migrating?** See the [v2.x → v3.0 guide](docs/migration-3.0.md) for the new `Subscription` shape and notification handling, or the [v1.x → v2.0 guide](MIGRATION.md) for the older transition.
+> **📚 Migrating?** See the [v2.x → v3.0 guide](https://github.com/wboayue/rust-ibapi/blob/b140b312d1136d240f3b5651a89f4778e01aa222/docs/migration-3.0.md) for the new `Subscription` shape and notification handling, or the [v1.x → v2.0 guide](https://github.com/wboayue/rust-ibapi/blob/b140b312d1136d240f3b5651a89f4778e01aa222/MIGRATION.md) for the older transition.
 
 If you encounter any issues or require a missing feature, please review the [issues list](https://github.com/wboayue/rust-ibapi/issues) before submitting a new one.
 
@@ -103,6 +105,7 @@ async fn main() {
     println!("Successfully connected to TWS at {connection_url}");
 }
 ```
+
 > **Note**: Use `127.0.0.1` instead of `localhost` for the connection. On some systems, `localhost` resolves to an IPv6 address, which TWS may block. TWS only allows specifying IPv4 addresses in the allowed IP addresses list.
 
 ### Creating Contracts
@@ -144,7 +147,7 @@ let treasury = Contract::bond_cusip("912810RN0");
 let euro_bond = Contract::bond_isin("DE0001102309");
 ```
 
-See the [Contract Builder Guide](docs/contract-builder.md) for comprehensive documentation on all contract types.
+See the [Contract Builder Guide](https://github.com/wboayue/rust-ibapi/blob/b140b312d1136d240f3b5651a89f4778e01aa222/docs/contract-builder.md) for comprehensive documentation on all contract types.
 
 For a complete list of contract attributes, explore the [Contract documentation](https://docs.rs/ibapi/latest/ibapi/contracts/struct.Contract.html).
 
@@ -352,11 +355,12 @@ fn main() {
     }
 }
 ```
+
 > **Note:** When using `zip`, the iteration will stop if either subscription ends. For independent processing, consider handling each subscription separately.
 
 ### Placing Orders
 
-For a comprehensive guide on all supported order types and their usage, see the [Order Types Guide](docs/order-types.md).
+For a comprehensive guide on all supported order types and their usage, see the [Order Types Guide](https://github.com/wboayue/rust-ibapi/blob/b140b312d1136d240f3b5651a89f4778e01aa222/docs/order-types.md).
 
 #### Sync Example
 
@@ -568,6 +572,7 @@ async fn main() {
 ```
 
 The order update stream provides real-time notifications for:
+
 - **OrderStatus**: Status changes typed as [`OrderStatusKind`](https://docs.rs/ibapi/latest/ibapi/orders/enum.OrderStatusKind.html) (`Submitted`, `Filled`, `Cancelled`, …) with `is_active()` / `is_terminal()` helpers
 - **OpenOrder**: Order details when opened or modified
 - **ExecutionData**: Fill notifications with price and quantity
@@ -647,10 +652,10 @@ async fn main() {
 Pick the iterator/stream shape based on whether the call site cares about
 notices:
 
-| Want                                  | Sync                            | Async                          |
-|---------------------------------------|---------------------------------|--------------------------------|
-| **Data only** (notices logged at warn) | `subscription.iter_data()` / `next_data()` | `subscription.filter_data()` (then `.next().await`) |
-| **Data + notices** (full visibility)   | `subscription.iter()` / `next()` | `subscription.next().await` (matches on `SubscriptionItem`) |
+| Want                                   | Sync                                       | Async                                                       |
+| -------------------------------------- | ------------------------------------------ | ----------------------------------------------------------- |
+| **Data only** (notices logged at warn) | `subscription.iter_data()` / `next_data()` | `subscription.filter_data()` (then `.next().await`)         |
+| **Data + notices** (full visibility)   | `subscription.iter()` / `next()`           | `subscription.next().await` (matches on `SubscriptionItem`) |
 
 Most call sites (downstream business logic, indicators, paper-trading loops)
 want `iter_data()` / `filter_data()` — notices are observability concerns and
