@@ -64,6 +64,39 @@ fn test_encode_delta_neutral() {
     assert_eq!(dnc_proto.price, Some(45.0));
 }
 
+/// IBKR `Minutes` must be serialized verbatim in the `Order.tif` wire field, and the existing
+/// time-in-force wire values must stay byte-for-byte unchanged.
+#[test]
+fn test_encode_order_tif_wire_values() {
+    let cases = [
+        (TimeInForce::Day, "DAY"),
+        (TimeInForce::GoodTilCanceled, "GTC"),
+        (TimeInForce::ImmediateOrCancel, "IOC"),
+        (TimeInForce::GoodTilDate, "GTD"),
+        (TimeInForce::Minutes, "Minutes"),
+    ];
+
+    for (tif, expected) in cases {
+        let order = Order {
+            action: Action::Buy,
+            total_quantity: 1.0,
+            order_type: "LMT".to_string(),
+            limit_price: Some(150.0),
+            tif,
+            transmit: true,
+            ..Default::default()
+        };
+
+        let proto = encode_order(&order);
+
+        assert_eq!(
+            proto.tif.as_deref(),
+            Some(expected),
+            "Order.tif must serialize exactly as {expected}"
+        );
+    }
+}
+
 #[test]
 fn test_encode_order_basic() {
     let order = Order {

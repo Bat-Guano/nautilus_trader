@@ -206,6 +206,7 @@ mod tests {
     #[case("FOK", IbTimeInForce::FillOrKill, NautilusTimeInForce::Fok)]
     #[case("DTC", IbTimeInForce::DayTilCanceled, NautilusTimeInForce::Day)]
     #[case("AUC", IbTimeInForce::Auction, NautilusTimeInForce::Day)]
+    #[case("Minutes", IbTimeInForce::Minutes, NautilusTimeInForce::Day)]
     fn test_ib_time_in_force_parse(
         #[case] value: &str,
         #[case] expected_time_in_force: IbTimeInForce,
@@ -222,6 +223,45 @@ mod tests {
             IbTimeInForce::from(time_in_force.ibapi_time_in_force()),
             expected_time_in_force
         );
+    }
+
+    /// IBKR `Minutes` is IB-specific: no cross-venue Nautilus time-in-force may produce it, so a
+    /// Nautilus order can never silently become a wire `Minutes` order.
+    #[rstest]
+    fn test_ib_minutes_is_not_reachable_from_nautilus_time_in_force() {
+        let nautilus_values = [
+            NautilusTimeInForce::Day,
+            NautilusTimeInForce::Gtc,
+            NautilusTimeInForce::Ioc,
+            NautilusTimeInForce::Fok,
+            NautilusTimeInForce::Gtd,
+            NautilusTimeInForce::AtTheOpen,
+            NautilusTimeInForce::AtTheClose,
+        ];
+
+        for value in nautilus_values {
+            assert_ne!(
+                IbTimeInForce::from_nautilus(value),
+                IbTimeInForce::Minutes,
+                "{value:?} must not map to IBKR Minutes"
+            );
+        }
+    }
+
+    /// Unknown time-in-force input fails closed; only the exact wire spelling `Minutes` is
+    /// accepted for the IB-specific Minutes value.
+    #[rstest]
+    #[case("")]
+    #[case("MINUTES")]
+    #[case("minutes")]
+    #[case("Minute")]
+    #[case("mins")]
+    #[case("M")]
+    #[case("GTD2")]
+    fn test_ib_time_in_force_unknown_fails_closed(#[case] value: &str) {
+        let error = IbTimeInForce::from_str(value).unwrap_err();
+
+        assert!(error.to_string().contains("Unknown IB time in force"));
     }
 
     #[rstest]

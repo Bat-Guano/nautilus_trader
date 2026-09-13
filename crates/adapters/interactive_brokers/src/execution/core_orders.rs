@@ -9,12 +9,47 @@
 
 use super::*;
 
+/// Transmission boundary for IBKR order submission.
+///
+/// This seam isolates the socket send so that submission semantics can be verified against a
+/// controlled fake, and so that transmission success is never conflated with broker
+/// acknowledgement. A successful call only proves the request left the adapter: broker
+/// acceptance is emitted exclusively from authoritative IB callbacks
+/// (`orderStatus`/`openOrder` `Submitted` and `PreSubmitted`).
+#[async_trait::async_trait]
+pub(super) trait OrderTransmission: Send + Sync {
+    /// Transmits an order to IBKR.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ibapi::Error`] if the order could not be transmitted. Returning `Ok` does
+    /// **not** imply the broker accepted the order.
+    async fn transmit_order(
+        &self,
+        ib_order_id: i32,
+        contract: &Contract,
+        order: &ibapi::orders::Order,
+    ) -> Result<(), ibapi::Error>;
+}
+
+#[async_trait::async_trait]
+impl OrderTransmission for Client {
+    async fn transmit_order(
+        &self,
+        ib_order_id: i32,
+        contract: &Contract,
+        order: &ibapi::orders::Order,
+    ) -> Result<(), ibapi::Error> {
+        Self::submit_order(self, ib_order_id, contract, order).await
+    }
+}
+
 #[allow(dead_code)]
 impl InteractiveBrokersExecutionClient {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_submit_order_async(
         cmd: &SubmitOrder,
-        client: &Arc<Client>,
+        transmission: &impl OrderTransmission,
         order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
@@ -154,7 +189,10 @@ impl InteractiveBrokersExecutionClient {
             .send(ExecutionEvent::Order(OrderEventAny::Submitted(event)))
             .map_err(|e| anyhow::anyhow!("Failed to send order submitted event: {e}"))?;
 
-        if let Err(e) = client.submit_order(ib_order_id, &contract, &ib_order).await {
+        if let Err(e) = transmission
+            .transmit_order(ib_order_id, &contract, &ib_order)
+            .await
+        {
             return Self::handle_order_submit_failure(
                 &e,
                 "Failed to submit order",
@@ -173,14 +211,10 @@ impl InteractiveBrokersExecutionClient {
             );
         }
 
-        Self::emit_order_accepted_if_needed(
-            ib_order_id,
-            VenueOrderId::from(ib_order_id.to_string()),
-            account_id,
-            ts_event,
-            active_order_contexts,
-            exec_sender,
-        )?;
+        // Transmission success is not broker acknowledgement: no `OrderAccepted` is emitted
+        // here, and none may be inferred from a successful send. Acceptance is emitted only
+        // from authoritative IB callbacks (`orderStatus`/`openOrder` `Submitted` or
+        // `PreSubmitted`) in `core_updates.rs`, deduplicated by the tracked order context.
 
         tracing::debug!(
             "Submitted order {} as IB order ID {}",
@@ -402,7 +436,7 @@ impl InteractiveBrokersExecutionClient {
     pub(super) async fn handle_submit_order_list_async(
         cmd: &SubmitOrderList,
         orders: &[OrderAny],
-        client: &Arc<Client>,
+        transmission: &impl OrderTransmission,
         order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
@@ -512,8 +546,8 @@ impl InteractiveBrokersExecutionClient {
                 .send(ExecutionEvent::Order(OrderEventAny::Submitted(event)))
                 .map_err(|e| anyhow::anyhow!("Failed to send order submitted event: {e}"))?;
 
-            if let Err(e) = client
-                .submit_order(ib_order_id, &order_contract, &ib_order)
+            if let Err(e) = transmission
+                .transmit_order(ib_order_id, &order_contract, &ib_order)
                 .await
             {
                 return Self::handle_order_submit_failure(
@@ -534,14 +568,9 @@ impl InteractiveBrokersExecutionClient {
                 );
             }
 
-            Self::emit_order_accepted_if_needed(
-                ib_order_id,
-                VenueOrderId::from(ib_order_id.to_string()),
-                account_id,
-                ts_event,
-                active_order_contexts,
-                exec_sender,
-            )?;
+            // As above: transmission success is not broker acknowledgement, so no acceptance
+            // is emitted for a successfully sent list child. Acceptance follows the
+            // authoritative IB callback for that order ID.
 
             tracing::debug!(
                 "Submitted order {} from list as IB order ID {}",

@@ -863,6 +863,11 @@ pub enum TimeInForce {
     DayTilCanceled,
     /// Auction - for auction orders.
     Auction,
+    /// Minutes. The order remains active for a venue-defined number of minutes and is
+    /// automatically canceled if it does not execute first. This is the native IBKR
+    /// time-in-force selector for the crypto `Minutes` mode and is transmitted verbatim
+    /// as `Minutes` in the `Order.tif` wire field.
+    Minutes,
 }
 
 impl ToField for TimeInForce {
@@ -882,6 +887,7 @@ impl std::fmt::Display for TimeInForce {
             TimeInForce::FillOrKill => "FOK",
             TimeInForce::DayTilCanceled => "DTC",
             TimeInForce::Auction => "AUC",
+            TimeInForce::Minutes => "Minutes",
         };
         write!(f, "{text}")
     }
@@ -904,6 +910,9 @@ impl From<&str> for TimeInForce {
             "FOK" => TimeInForce::FillOrKill,
             "DTC" => TimeInForce::DayTilCanceled,
             "AUC" => TimeInForce::Auction,
+            // Exact-case match only: the IBKR wire vocabulary is `Minutes`, and case
+            // variants below the exact value are intentionally not coerced.
+            "Minutes" => TimeInForce::Minutes,
             _ => TimeInForce::Day, // Default fallback
         }
     }

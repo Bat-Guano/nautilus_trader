@@ -464,14 +464,34 @@ pub enum IbTimeInForce {
     DayTilCanceled,
     /// Auction order.
     Auction,
+    /// Minutes order.
+    ///
+    /// The order remains active for a venue-defined number of minutes and is automatically
+    /// canceled if it does not execute first. This is the IBKR-native selector for the crypto
+    /// `Minutes` mode and is transmitted verbatim as `Minutes` in the `Order.tif` wire field.
+    ///
+    /// Nautilus has no cross-venue `Minutes` time-in-force and this adapter deliberately does not
+    /// widen the core model, so this variant is IB-specific and is only reachable from
+    /// IB-specific input (see [`IbTimeInForce::from_nautilus`] and
+    /// [`IbTimeInForce::nautilus_time_in_force`] for the documented lossy projection).
+    Minutes,
 }
 
 impl IbTimeInForce {
     /// Converts this IB time-in-force to a Nautilus time-in-force.
+    ///
+    /// IB-specific values without a cross-venue Nautilus equivalent are projected onto the
+    /// closest bounded-expiry Nautilus value. This projection is intentionally lossy and is
+    /// never used to build the IB wire value: [`Self::Minutes`] round-trips to IBKR as the exact
+    /// wire string `Minutes` through [`Self::ibapi_time_in_force`], while the Nautilus-facing
+    /// projection is `Day` because a `Minutes` order self-expires and is therefore never
+    /// good-till-canceled.
     #[must_use]
     pub const fn nautilus_time_in_force(self) -> NautilusTimeInForce {
         match self {
-            Self::Day | Self::DayTilCanceled | Self::Auction => NautilusTimeInForce::Day,
+            Self::Day | Self::DayTilCanceled | Self::Auction | Self::Minutes => {
+                NautilusTimeInForce::Day
+            }
             Self::GoodTilCanceled => NautilusTimeInForce::Gtc,
             Self::ImmediateOrCancel => NautilusTimeInForce::Ioc,
             Self::GoodTilDate => NautilusTimeInForce::Gtd,
@@ -481,6 +501,10 @@ impl IbTimeInForce {
     }
 
     /// Converts a Nautilus time-in-force to the corresponding IB time-in-force.
+    ///
+    /// No Nautilus time-in-force maps to [`Self::Minutes`]: IBKR `Minutes` is only reachable
+    /// through the IB-specific input path (`IBOrderTags` `tif`), so a cross-venue Nautilus
+    /// order can never silently become a wire `Minutes` order.
     #[must_use]
     pub const fn from_nautilus(time_in_force: NautilusTimeInForce) -> Self {
         match time_in_force {
@@ -505,6 +529,7 @@ impl IbTimeInForce {
             Self::FillOrKill => ibapi::orders::TimeInForce::FillOrKill,
             Self::DayTilCanceled => ibapi::orders::TimeInForce::DayTilCanceled,
             Self::Auction => ibapi::orders::TimeInForce::Auction,
+            Self::Minutes => ibapi::orders::TimeInForce::Minutes,
         }
     }
 }
@@ -520,6 +545,7 @@ impl From<ibapi::orders::TimeInForce> for IbTimeInForce {
             ibapi::orders::TimeInForce::FillOrKill => Self::FillOrKill,
             ibapi::orders::TimeInForce::DayTilCanceled => Self::DayTilCanceled,
             ibapi::orders::TimeInForce::Auction => Self::Auction,
+            ibapi::orders::TimeInForce::Minutes => Self::Minutes,
         }
     }
 }
@@ -527,6 +553,11 @@ impl From<ibapi::orders::TimeInForce> for IbTimeInForce {
 impl FromStr for IbTimeInForce {
     type Err = anyhow::Error;
 
+    /// Parses an IB time-in-force from its exact wire value.
+    ///
+    /// Unknown values fail closed with an error. The IBKR `Minutes` value is matched in exact
+    /// case only, so `MINUTES`/`minutes` remain unknown input rather than being coerced into a
+    /// different wire value.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "DAY" => Ok(Self::Day),
@@ -537,6 +568,7 @@ impl FromStr for IbTimeInForce {
             "FOK" => Ok(Self::FillOrKill),
             "DTC" => Ok(Self::DayTilCanceled),
             "AUC" => Ok(Self::Auction),
+            "Minutes" => Ok(Self::Minutes),
             _ => anyhow::bail!("Unknown IB time in force: {value}"),
         }
     }
@@ -553,6 +585,7 @@ impl Display for IbTimeInForce {
             Self::FillOrKill => "FOK",
             Self::DayTilCanceled => "DTC",
             Self::Auction => "AUC",
+            Self::Minutes => "Minutes",
         })
     }
 }

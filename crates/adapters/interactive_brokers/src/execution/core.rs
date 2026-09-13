@@ -325,7 +325,7 @@ impl InteractiveBrokersExecutionClient {
             if let Err(e) = Self::handle_submit_order_list_async(
                 &cmd,
                 &orders,
-                &client_clone,
+                &*client_clone,
                 &order_id_map,
                 &venue_order_id_map,
                 &instrument_id_map,
@@ -581,7 +581,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let future = async move {
             if let Err(e) = Self::handle_submit_order_async(
                 &cmd,
-                &client_clone,
+                &*client_clone,
                 &order_id_map,
                 &venue_order_id_map,
                 &instrument_id_map,

@@ -214,6 +214,7 @@ pub(crate) struct TargetedOrderReportResult {
     client_order_id: ClientOrderId,
     client_id: Option<ClientId>,
     report: Option<OrderStatusReport>,
+    raw_report_published: bool,
     fills: Vec<FillReport>,
     coverage_complete: bool,
 }
@@ -650,11 +651,8 @@ impl ExecutionManager {
         // below, which can synthesise replacement order/fill reports). The
         // execution engine's per-report `reconcile_*` entry points are bypassed by
         // this path, so the capture seam lives here.
-        let raw_order_status_topic =
-            MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
-
         for report in mass_status.order_reports().values() {
-            msgbus::publish_any(raw_order_status_topic, report);
+            publish_raw_order_status_report(report);
         }
 
         let raw_fill_topic = MessagingSwitchboard::reconciliation_raw_fill_report_topic();
@@ -2293,6 +2291,10 @@ impl ExecutionManager {
         failed_clients: &IndexSet<ClientId>,
         clients: &[&dyn ExecutionClient],
     ) -> OpenOrderReconciliationResult {
+        for sourced in &all_reports {
+            publish_raw_order_status_report(&sourced.report);
+        }
+
         all_reports.retain(|sourced| !self.should_skip_order_report(&sourced.report));
         let mut venue_reported_ids = IndexSet::new();
 
@@ -2572,6 +2574,12 @@ impl ExecutionManager {
         let mut fill_queue = ReconciliationFillQueue::default();
 
         for result in results {
+            if !result.raw_report_published
+                && let Some(report) = &result.report
+            {
+                publish_raw_order_status_report(report);
+            }
+
             let client_order_id = result.client_order_id;
             self.targeted_order_queries.shift_remove(&client_order_id);
 
@@ -5520,6 +5528,7 @@ pub(crate) async fn request_targeted_order_reports(
 
     for mut query in queries {
         let mut report = None;
+        let mut raw_report_published = false;
         let mut fills = Vec::new();
         let mut report_client_id = None;
         let mut coverage_complete = true;
@@ -5543,11 +5552,15 @@ pub(crate) async fn request_targeted_order_reports(
             }
             request_count += 1;
 
-            let response = if let Some(report) = query.report.take() {
-                Ok(Some(report))
-            } else {
-                client.generate_order_status_report(&query.command).await
-            };
+            let (response, response_raw_report_published) =
+                if let Some(report) = query.report.take() {
+                    (Ok(Some(report)), true)
+                } else {
+                    (
+                        client.generate_order_status_report(&query.command).await,
+                        false,
+                    )
+                };
 
             match response {
                 Ok(Some(candidate)) if targeted_report_matches(&query, &candidate) => {
@@ -5585,6 +5598,7 @@ pub(crate) async fn request_targeted_order_reports(
                         }
                     }
                     report = Some(candidate);
+                    raw_report_published = response_raw_report_published;
                     report_client_id = Some(client_id);
                     break;
                 }
@@ -5613,6 +5627,7 @@ pub(crate) async fn request_targeted_order_reports(
             client_order_id: query.client_order_id,
             client_id: report_client_id,
             report,
+            raw_report_published,
             fills,
             coverage_complete,
         });
@@ -5635,6 +5650,11 @@ fn targeted_report_matches(query: &TargetedOrderQuery, report: &OrderStatusRepor
     instrument_matches && order_matches
 }
 
+fn publish_raw_order_status_report(report: &OrderStatusReport) {
+    let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+    msgbus::publish_any(topic, report);
+}
+
 fn terminal_report_has_missing_fills(report: &OrderStatusReport, filled_qty: Quantity) -> bool {
     matches!(
         report.order_status,
@@ -5645,6 +5665,7 @@ fn terminal_report_has_missing_fills(report: &OrderStatusReport, filled_qty: Qua
 #[cfg(test)]
 mod tests {
     use nautilus_common::clock::TestClock;
+    use nautilus_common::msgbus::{ShareableMessageHandler, stubs::get_any_saving_handler};
     use nautilus_core::{DurationNanos, Params};
     use nautilus_execution::reconciliation::generate_reconciliation_order_events;
     use nautilus_model::{
@@ -6696,6 +6717,595 @@ mod tests {
         assert_eq!(*client.seen.borrow(), None);
     }
 
+    fn periodic_canceled_report(
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        filled_qty: Quantity,
+    ) -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("TEST-001"),
+            crypto_perpetual_ethusdt().id(),
+            Some(client_order_id),
+            venue_order_id,
+            OrderSide::Buy.into(),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Canceled,
+            Quantity::from("10.0"),
+            filled_qty,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )
+        .with_price(Price::from("100.0"))
+        .with_avg_px(dec!(100.0))
+    }
+
+    fn periodic_open_order_check(
+        orders: Vec<OrderAny>,
+        client_id: ClientId,
+    ) -> OpenOrderReportCheck {
+        let client_coverage = orders
+            .iter()
+            .map(|order| {
+                (
+                    order.client_order_id(),
+                    ReportClientCoverage::Resolved(IndexSet::from([client_id])),
+                )
+            })
+            .collect();
+
+        OpenOrderReportCheck {
+            command: GenerateOrderStatusReports::new(
+                UUID4::new(),
+                UnixNanos::from(1),
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            filtered_orders: orders,
+            client_coverage,
+            start: None,
+        }
+    }
+
+    #[rstest]
+    fn test_periodic_raw_order_status_bulk_publishes_once_before_single_mutation() {
+        let client_order_id = ClientOrderId::from("O-PERIODIC-RAW-BULK");
+        let venue_order_id = VenueOrderId::from("V-PERIODIC-RAW-BULK");
+        let client_id = ClientId::from("BINANCE");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            crypto_perpetual_ethusdt().id(),
+            client_id,
+        );
+        let order = cache.borrow().order_owned(&client_order_id).unwrap();
+        let check = periodic_open_order_check(vec![order], client_id);
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            cache.clone(),
+            ExecutionManagerConfig {
+                open_check_threshold_ns: DurationNanos::ZERO,
+                ..Default::default()
+            },
+        )
+        .expect("valid config");
+        let report =
+            periodic_canceled_report(client_order_id, venue_order_id, Quantity::from("0.0"));
+
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        let pattern: msgbus::MStr<msgbus::Pattern> = topic.into();
+        let (saving_handler, saver) = get_any_saving_handler::<OrderStatusReport>(None);
+        let observed_statuses = Rc::new(RefCell::new(Vec::new()));
+        let observation_handler = ShareableMessageHandler::from_typed({
+            let cache = cache.clone();
+            let observed_statuses = observed_statuses.clone();
+            move |_report: &OrderStatusReport| {
+                observed_statuses.borrow_mut().push(
+                    cache
+                        .borrow()
+                        .order(&client_order_id)
+                        .expect("cached order exists during raw publication")
+                        .status(),
+                );
+            }
+        });
+        msgbus::subscribe_any(pattern, saving_handler.clone(), None);
+        msgbus::subscribe_any(pattern, observation_handler.clone(), None);
+
+        let result = manager.reconcile_open_order_reports(
+            &check,
+            vec![SourcedOrderStatusReport {
+                client_id,
+                report: report.clone(),
+            }],
+            &IndexSet::from([client_id]),
+            &IndexSet::new(),
+            &[],
+        );
+
+        msgbus::unsubscribe_any(pattern, &saving_handler);
+        msgbus::unsubscribe_any(pattern, &observation_handler);
+
+        assert_eq!(saver.get_messages(), vec![report]);
+        assert_eq!(*observed_statuses.borrow(), vec![OrderStatus::Accepted]);
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(result.events[0], OrderEventAny::Canceled(_)));
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Accepted,
+            "periodic reconciliation must not hide a second direct state application",
+        );
+
+        cache.borrow_mut().update_order(&result.events[0]).unwrap();
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Canceled,
+        );
+    }
+
+    #[rstest]
+    fn test_periodic_raw_order_status_bulk_multiple_and_empty_results() {
+        let client_id = ClientId::from("BINANCE");
+        let first_client_order_id = ClientOrderId::from("O-PERIODIC-RAW-MULTI-1");
+        let second_client_order_id = ClientOrderId::from("O-PERIODIC-RAW-MULTI-2");
+        let first_venue_order_id = VenueOrderId::from("V-PERIODIC-RAW-MULTI-1");
+        let second_venue_order_id = VenueOrderId::from("V-PERIODIC-RAW-MULTI-2");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        for (client_order_id, venue_order_id) in [
+            (first_client_order_id, first_venue_order_id),
+            (second_client_order_id, second_venue_order_id),
+        ] {
+            insert_accepted_limit_order(
+                &cache,
+                client_order_id,
+                venue_order_id,
+                crypto_perpetual_ethusdt().id(),
+                client_id,
+            );
+        }
+        let orders = [first_client_order_id, second_client_order_id]
+            .into_iter()
+            .map(|client_order_id| cache.borrow().order_owned(&client_order_id).unwrap())
+            .collect();
+        let check = periodic_open_order_check(orders, client_id);
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            cache,
+            ExecutionManagerConfig {
+                open_check_threshold_ns: DurationNanos::ZERO,
+                ..Default::default()
+            },
+        )
+        .expect("valid config");
+        let reports = vec![
+            periodic_canceled_report(
+                first_client_order_id,
+                first_venue_order_id,
+                Quantity::from("0.0"),
+            ),
+            periodic_canceled_report(
+                second_client_order_id,
+                second_venue_order_id,
+                Quantity::from("0.0"),
+            ),
+        ];
+
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        let pattern: msgbus::MStr<msgbus::Pattern> = topic.into();
+        let (handler, saver) = get_any_saving_handler::<OrderStatusReport>(None);
+        msgbus::subscribe_any(pattern, handler.clone(), None);
+
+        let sourced_reports = reports
+            .iter()
+            .cloned()
+            .map(|report| SourcedOrderStatusReport { client_id, report })
+            .collect();
+        let multiple = manager.reconcile_open_order_reports(
+            &check,
+            sourced_reports,
+            &IndexSet::from([client_id]),
+            &IndexSet::new(),
+            &[],
+        );
+        let empty = manager.reconcile_open_order_reports(
+            &check,
+            Vec::new(),
+            &IndexSet::from([client_id]),
+            &IndexSet::new(),
+            &[],
+        );
+
+        msgbus::unsubscribe_any(pattern, &handler);
+
+        assert_eq!(saver.get_messages(), reports);
+        assert_eq!(multiple.events.len(), 2);
+        assert!(empty.events.is_empty());
+    }
+
+    #[rstest]
+    fn test_periodic_raw_order_status_targeted_publishes_once_before_single_mutation() {
+        let client_order_id = ClientOrderId::from("O-PERIODIC-RAW-TARGETED");
+        let venue_order_id = VenueOrderId::from("V-PERIODIC-RAW-TARGETED");
+        let client_id = ClientId::from("BINANCE");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            crypto_perpetual_ethusdt().id(),
+            client_id,
+        );
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            cache.clone(),
+            ExecutionManagerConfig::default(),
+        )
+        .expect("valid config");
+        manager.targeted_order_queries.insert(client_order_id);
+        let report =
+            periodic_canceled_report(client_order_id, venue_order_id, Quantity::from("0.0"));
+
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        let pattern: msgbus::MStr<msgbus::Pattern> = topic.into();
+        let (saving_handler, saver) = get_any_saving_handler::<OrderStatusReport>(None);
+        let observed_statuses = Rc::new(RefCell::new(Vec::new()));
+        let observation_handler = ShareableMessageHandler::from_typed({
+            let cache = cache.clone();
+            let observed_statuses = observed_statuses.clone();
+            move |_report: &OrderStatusReport| {
+                observed_statuses.borrow_mut().push(
+                    cache
+                        .borrow()
+                        .order(&client_order_id)
+                        .expect("cached order exists during raw publication")
+                        .status(),
+                );
+            }
+        });
+        msgbus::subscribe_any(pattern, saving_handler.clone(), None);
+        msgbus::subscribe_any(pattern, observation_handler.clone(), None);
+
+        let events = manager.reconcile_targeted_order_reports(
+            vec![TargetedOrderReportResult {
+                client_order_id,
+                client_id: Some(client_id),
+                report: Some(report.clone()),
+                raw_report_published: false,
+                fills: Vec::new(),
+                coverage_complete: true,
+            }],
+            &[],
+        );
+
+        msgbus::unsubscribe_any(pattern, &saving_handler);
+        msgbus::unsubscribe_any(pattern, &observation_handler);
+
+        assert_eq!(saver.get_messages(), vec![report]);
+        assert_eq!(*observed_statuses.borrow(), vec![OrderStatus::Accepted]);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OrderEventAny::Canceled(_)));
+        assert!(!manager.targeted_order_queries.contains(&client_order_id));
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Accepted,
+            "targeted reconciliation must not hide a second direct state application",
+        );
+
+        cache.borrow_mut().update_order(&events[0]).unwrap();
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Canceled,
+        );
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_periodic_raw_order_status_bulk_targeted_handoff_does_not_double_publish() {
+        let client_order_id = ClientOrderId::from("O-PERIODIC-RAW-HANDOFF");
+        let venue_order_id = VenueOrderId::from("V-PERIODIC-RAW-HANDOFF");
+        let client_id = ClientId::from("STUB");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            crypto_perpetual_ethusdt().id(),
+            client_id,
+        );
+        let order = cache.borrow().order_owned(&client_order_id).unwrap();
+        let check = periodic_open_order_check(vec![order], client_id);
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            cache,
+            ExecutionManagerConfig {
+                open_check_threshold_ns: DurationNanos::ZERO,
+                ..Default::default()
+            },
+        )
+        .expect("valid config");
+        let report =
+            periodic_canceled_report(client_order_id, venue_order_id, Quantity::from("1.0"));
+        let client = CommissionStubClient::new(CommissionOutcome::NoOverride);
+
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        let pattern: msgbus::MStr<msgbus::Pattern> = topic.into();
+        let (handler, saver) = get_any_saving_handler::<OrderStatusReport>(None);
+        msgbus::subscribe_any(pattern, handler.clone(), None);
+
+        let bulk = manager.reconcile_open_order_reports(
+            &check,
+            vec![SourcedOrderStatusReport {
+                client_id,
+                report: report.clone(),
+            }],
+            &IndexSet::from([client_id]),
+            &IndexSet::new(),
+            &[&client],
+        );
+        assert!(bulk.events.is_empty());
+        assert_eq!(bulk.targeted_queries.len(), 1);
+
+        let targeted_results =
+            request_targeted_order_reports(&[&client], bulk.targeted_queries, Duration::ZERO).await;
+        assert_eq!(targeted_results.len(), 1);
+        assert!(targeted_results[0].raw_report_published);
+        let _events = manager.reconcile_targeted_order_reports(targeted_results, &[&client]);
+
+        msgbus::unsubscribe_any(pattern, &handler);
+
+        assert_eq!(saver.get_messages(), vec![report]);
+    }
+
+    #[rstest]
+    fn test_periodic_raw_order_status_suppressed_report_published_once_before_filter_gate() {
+        let suppressed_client_order_id = ClientOrderId::from("O-SUPPRESSED-RAW");
+        let suppressed_venue_order_id = VenueOrderId::from("V-SUPPRESSED-RAW");
+        let reconciled_client_order_id = ClientOrderId::from("O-RECONCILED-RAW");
+        let reconciled_venue_order_id = VenueOrderId::from("V-RECONCILED-RAW");
+        let client_id = ClientId::from("BINANCE");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        for (client_order_id, venue_order_id) in [
+            (suppressed_client_order_id, suppressed_venue_order_id),
+            (reconciled_client_order_id, reconciled_venue_order_id),
+        ] {
+            insert_accepted_limit_order(
+                &cache,
+                client_order_id,
+                venue_order_id,
+                crypto_perpetual_ethusdt().id(),
+                client_id,
+            );
+        }
+        let orders = [suppressed_client_order_id, reconciled_client_order_id]
+            .into_iter()
+            .map(|client_order_id| cache.borrow().order_owned(&client_order_id).unwrap())
+            .collect();
+        let check = periodic_open_order_check(orders, client_id);
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            cache,
+            ExecutionManagerConfig {
+                open_check_threshold_ns: DurationNanos::ZERO,
+                // The genuine suppression gate for the first report.
+                filtered_client_order_ids: IndexSet::from([suppressed_client_order_id]),
+                ..Default::default()
+            },
+        )
+        .expect("valid config");
+        let suppressed_report = periodic_canceled_report(
+            suppressed_client_order_id,
+            suppressed_venue_order_id,
+            Quantity::from("0.0"),
+        );
+        let reconciled_report = periodic_canceled_report(
+            reconciled_client_order_id,
+            reconciled_venue_order_id,
+            Quantity::from("0.0"),
+        );
+
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        let pattern: msgbus::MStr<msgbus::Pattern> = topic.into();
+        let (handler, saver) = get_any_saving_handler::<OrderStatusReport>(None);
+        msgbus::subscribe_any(pattern, handler.clone(), None);
+
+        let result = manager.reconcile_open_order_reports(
+            &check,
+            vec![
+                SourcedOrderStatusReport {
+                    client_id,
+                    report: suppressed_report.clone(),
+                },
+                SourcedOrderStatusReport {
+                    client_id,
+                    report: reconciled_report.clone(),
+                },
+            ],
+            &IndexSet::from([client_id]),
+            &IndexSet::new(),
+            &[],
+        );
+
+        msgbus::unsubscribe_any(pattern, &handler);
+
+        let observed = saver.get_messages();
+
+        // Differential control (no raw subscription active yet): the exact same
+        // authoritative report, offered to a manager WITHOUT the suppression
+        // config, does reconcile. So the zero derived processing observed below
+        // is caused by the `filtered_client_order_ids` gate, not by a fixture
+        // that could never reconcile at all.
+        let mut control_manager = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(Cache::default())),
+            ExecutionManagerConfig {
+                open_check_threshold_ns: DurationNanos::ZERO,
+                ..Default::default()
+            },
+        )
+        .expect("valid config");
+        for (client_order_id, venue_order_id) in [
+            (suppressed_client_order_id, suppressed_venue_order_id),
+            (reconciled_client_order_id, reconciled_venue_order_id),
+        ] {
+            insert_accepted_limit_order(
+                &control_manager.cache.clone(),
+                client_order_id,
+                venue_order_id,
+                crypto_perpetual_ethusdt().id(),
+                client_id,
+            );
+        }
+        let control = control_manager.reconcile_open_order_reports(
+            &check,
+            vec![SourcedOrderStatusReport {
+                client_id,
+                report: suppressed_report.clone(),
+            }],
+            &IndexSet::from([client_id]),
+            &IndexSet::new(),
+            &[],
+        );
+        assert_eq!(
+            control.events.len(),
+            1,
+            "control: the unfiltered report must reconcile, otherwise the suppression assertion is vacuous",
+        );
+        assert_eq!(
+            control.events[0].client_order_id(),
+            suppressed_client_order_id
+        );
+
+        // No duplicate raw publication: each authoritative broker report is
+        // observed on the raw ingress channel exactly once.
+        assert_eq!(
+            observed.len(),
+            2,
+            "expected raw publication exactly once per authoritative report, observed {observed:?}",
+        );
+        // The report this gate suppresses must still reach the raw ingress
+        // channel: publication happens before any suppression decision.
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|observed_report| {
+                    observed_report.client_order_id == Some(suppressed_client_order_id)
+                })
+                .count(),
+            1,
+            "the gate-suppressed broker report never reached the raw ingress channel, observed {observed:?}",
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|observed_report| {
+                    observed_report.client_order_id == Some(reconciled_client_order_id)
+                })
+                .count(),
+            1,
+            "the reconciled broker report was not published exactly once, observed {observed:?}",
+        );
+        assert_eq!(observed[0], suppressed_report);
+
+        // The suppression condition actually occurred (the first report matched
+        // `filtered_client_order_ids`) and the downstream reconciliation result
+        // reflects it: no derived processing at all for the suppressed report,
+        // while the surviving report still produced its derived reconciliation
+        // exactly once.
+        assert_eq!(
+            result.events.len(),
+            1,
+            "only the surviving report may produce derived reconciliation events",
+        );
+        let OrderEventAny::Canceled(canceled) = &result.events[0] else {
+            panic!("expected the surviving report's derived cancellation event");
+        };
+        assert_eq!(canceled.client_order_id, reconciled_client_order_id);
+        assert!(result.targeted_queries.is_empty());
+        assert_eq!(
+            manager.targeted_order_queries.len(),
+            0,
+            "no targeted reconciliation work may be scheduled from this check",
+        );
+        assert!(
+            !manager
+                .targeted_order_queries
+                .contains(&suppressed_client_order_id),
+            "the suppressed report must not schedule targeted reconciliation work",
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|observed_report| {
+                    observed_report.client_order_id == Some(suppressed_client_order_id)
+                })
+                .count(),
+            1,
+            "duplicate raw publication for the suppressed report",
+        );
+    }
+
+    #[rstest]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_periodic_raw_order_status_startup_mass_status_remains_single_publish() {
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut manager = ExecutionManager::new(
+            clock.clone(),
+            cache.clone(),
+            ExecutionManagerConfig::default(),
+        )
+        .expect("valid config");
+        let exec_engine = Rc::new(RefCell::new(ExecutionEngine::new(clock, cache, None)));
+        exec_engine
+            .borrow_mut()
+            .register_client(Box::new(CommissionStubClient::new(
+                CommissionOutcome::NoOverride,
+            )))
+            .expect("stub execution client registers");
+        let report = periodic_canceled_report(
+            ClientOrderId::from("O-STARTUP-RAW-SINGLE"),
+            VenueOrderId::from("V-STARTUP-RAW-SINGLE"),
+            Quantity::from("0.0"),
+        );
+        let mut mass_status = ExecutionMassStatus::new(
+            ClientId::from("STUB"),
+            AccountId::from("STUB-001"),
+            Venue::from("STUB"),
+            UnixNanos::from(1),
+            Some(UUID4::new()),
+        );
+        mass_status.add_order_reports(vec![report.clone()]);
+
+        let topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+        let pattern: msgbus::MStr<msgbus::Pattern> = topic.into();
+        let (handler, saver) = get_any_saving_handler::<OrderStatusReport>(None);
+        msgbus::subscribe_any(pattern, handler.clone(), None);
+
+        manager
+            .reconcile_execution_mass_status(mass_status, exec_engine)
+            .await;
+
+        msgbus::unsubscribe_any(pattern, &handler);
+
+        assert_eq!(saver.get_messages(), vec![report]);
+    }
+
     #[rstest]
     fn test_continuous_reconciliation_uses_source_client_and_retries_commission() {
         let (mut manager, _cache, order, report, _instrument) = cached_commission_fixtures();
@@ -7083,6 +7693,7 @@ mod tests {
                 client_order_id,
                 client_id: Some(client_id),
                 report: Some(report.clone()),
+                raw_report_published: false,
                 fills: Vec::new(),
                 coverage_complete: true,
             }],
@@ -7098,6 +7709,7 @@ mod tests {
                 client_order_id,
                 client_id: Some(client_id),
                 report: Some(report),
+                raw_report_published: false,
                 fills: Vec::new(),
                 coverage_complete: true,
             }],

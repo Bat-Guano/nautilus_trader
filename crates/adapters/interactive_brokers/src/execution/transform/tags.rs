@@ -303,6 +303,7 @@ fn ibapi_tif_serde_value(tif: IbTimeInForce) -> Value {
         IbTimeInForce::FillOrKill => "FillOrKill",
         IbTimeInForce::DayTilCanceled => "DayTilCanceled",
         IbTimeInForce::Auction => "Auction",
+        IbTimeInForce::Minutes => "Minutes",
     };
 
     Value::String(value.to_string())
@@ -515,4 +516,124 @@ fn push_tag_value(target: &mut Vec<TagValue>, tag: &str, value: &str) {
         tag: tag.to_string(),
         value: value.to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn order_tags(json: &str) -> Vec<Ustr> {
+        vec![Ustr::from(&format!("IBOrderTags:{json}"))]
+    }
+
+    fn tif_tag(value: &str) -> Vec<Ustr> {
+        order_tags(&format!("{{\"tif\":\"{value}\"}}"))
+    }
+
+    /// The exact string the rust-ibapi protobuf encoder writes into `Order.tif`:
+    /// `patches/ibapi/src/proto/encoders.rs` uses `some_str(&order.tif.to_string())`.
+    fn wire_tif(order: &IBOrder) -> String {
+        order.tif.to_string()
+    }
+
+    #[rstest]
+    #[case("Minutes", "Minutes")]
+    #[case("GTC", "GTC")]
+    #[case("DAY", "DAY")]
+    #[case("IOC", "IOC")]
+    #[case("GTD", "GTD")]
+    #[case("OPG", "OPG")]
+    #[case("FOK", "FOK")]
+    #[case("DTC", "DTC")]
+    #[case("AUC", "AUC")]
+    fn test_ib_order_tags_tif_serializes_exact_wire_value(
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        let mut order = IBOrder::default();
+
+        apply_ib_order_tags(&mut order, Some(&tif_tag(input))).unwrap();
+
+        assert_eq!(
+            wire_tif(&order),
+            expected,
+            "IBOrderTags tif {input} must serialize as the exact IBKR wire value {expected}"
+        );
+    }
+
+    #[rstest]
+    fn test_ib_order_tags_minutes_sets_ibapi_minutes_representation() {
+        let mut order = IBOrder::default();
+
+        apply_ib_order_tags(&mut order, Some(&tif_tag("Minutes"))).unwrap();
+
+        assert_eq!(order.tif, ibapi::orders::TimeInForce::Minutes);
+        assert_eq!(
+            IbTimeInForce::from(order.tif.clone()),
+            IbTimeInForce::Minutes
+        );
+        assert_eq!(wire_tif(&order), "Minutes");
+    }
+
+    #[rstest]
+    #[case("MINUTES")]
+    #[case("minutes")]
+    #[case("Minute")]
+    #[case("mins")]
+    #[case("MIN")]
+    #[case("NOT_A_TIF")]
+    fn test_ib_order_tags_tif_unknown_values_fail_closed(#[case] value: &str) {
+        let mut order = IBOrder::default();
+
+        let error = apply_ib_order_tags(&mut order, Some(&tif_tag(value))).unwrap_err();
+
+        assert!(
+            error.to_string().contains("tif"),
+            "expected a fail-closed tif error, was: {error}"
+        );
+        assert_eq!(
+            order.tif,
+            ibapi::orders::TimeInForce::Day,
+            "a rejected tif must leave the order unchanged"
+        );
+        assert_eq!(wire_tif(&order), "DAY");
+    }
+
+    #[rstest]
+    fn test_ib_order_tags_good_till_date_is_not_minutes() {
+        let mut order = IBOrder::default();
+        let tags = order_tags("{\"tif\":\"GTD\",\"good_till_date\":\"20260915 12:00:00 UTC\"}");
+
+        apply_ib_order_tags(&mut order, Some(&tags)).unwrap();
+
+        assert_eq!(order.tif, ibapi::orders::TimeInForce::GoodTilDate);
+        assert_eq!(wire_tif(&order), "GTD");
+        assert_eq!(order.good_till_date, "20260915 12:00:00 UTC");
+        assert_ne!(wire_tif(&order), "Minutes");
+    }
+
+    #[rstest]
+    fn test_ib_order_tags_duration_is_not_minutes() {
+        let mut order = IBOrder::default();
+
+        apply_ib_order_tags(&mut order, Some(&order_tags("{\"duration\":1}"))).unwrap();
+
+        assert_eq!(order.duration, Some(1));
+        assert_eq!(order.tif, ibapi::orders::TimeInForce::Day);
+        assert_eq!(wire_tif(&order), "DAY");
+    }
+
+    #[rstest]
+    fn test_ib_order_tags_minutes_overrides_core_derived_tif_only_when_requested() {
+        let mut order = IBOrder {
+            tif: ibapi::orders::TimeInForce::GoodTilCanceled,
+            ..Default::default()
+        };
+
+        apply_ib_order_tags(&mut order, Some(&order_tags("{\"order_type\":\"LMT\"}"))).unwrap();
+
+        assert_eq!(wire_tif(&order), "GTC");
+    }
 }

@@ -3209,3 +3209,661 @@ fn test_get_leg_position_three_leg_spread() {
     let result = InteractiveBrokersExecutionClient::get_leg_position(&spread_id, &leg_id3);
     assert_eq!(result, 2);
 }
+
+// -----------------------------------------------------------------------------------------------
+// C2.10-Q1-R2 WP2 — broker acceptance authority and IBKR Minutes wire support
+// -----------------------------------------------------------------------------------------------
+
+use super::core_orders::OrderTransmission;
+
+/// Controlled fake for the IBKR order transmission boundary.
+///
+/// Records every transmitted order so that submission semantics and the transmitted
+/// time-in-force can be asserted with zero broker contact.
+struct FakeOrderTransmission {
+    outcome: FakeTransmissionOutcome,
+    transmitted: Mutex<Vec<(i32, Contract, IBOrder)>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FakeTransmissionOutcome {
+    /// The socket send succeeded: this is transmission only, never broker acknowledgement.
+    Sent,
+    /// A definitive local failure: the request was never transmitted.
+    NotSent,
+}
+
+impl FakeOrderTransmission {
+    fn sent() -> Self {
+        Self {
+            outcome: FakeTransmissionOutcome::Sent,
+            transmitted: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn not_sent() -> Self {
+        Self {
+            outcome: FakeTransmissionOutcome::NotSent,
+            transmitted: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn transmitted_orders(&self) -> Vec<(i32, Contract, IBOrder)> {
+        self.transmitted.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl OrderTransmission for FakeOrderTransmission {
+    async fn transmit_order(
+        &self,
+        ib_order_id: i32,
+        contract: &Contract,
+        order: &IBOrder,
+    ) -> Result<(), ibapi::Error> {
+        match self.outcome {
+            FakeTransmissionOutcome::Sent => {
+                self.transmitted
+                    .lock()
+                    .push((ib_order_id, contract.clone(), order.clone()));
+                Ok(())
+            }
+            FakeTransmissionOutcome::NotSent => Err(ibapi::Error::ServerVersion(
+                170,
+                169,
+                "order feature not supported".to_string(),
+            )),
+        }
+    }
+}
+
+const WP2_TRADER_ID: &str = "TRADER-WP2";
+const WP2_STRATEGY_ID: &str = "STRATEGY-WP2";
+const WP2_ACCOUNT_ID: &str = "IB-WP2-001";
+
+fn wp2_minutes_tags() -> Vec<Ustr> {
+    vec![Ustr::from("IBOrderTags:{\"tif\":\"Minutes\"}")]
+}
+
+fn wp2_instrument_provider() -> (Arc<InteractiveBrokersInstrumentProvider>, InstrumentId) {
+    let equity = equity_aapl();
+    let instrument_id = equity.id();
+    let instrument_provider = create_test_instrument_provider();
+    instrument_provider.insert_test_instrument(InstrumentAny::from(equity), 12345, 1);
+
+    (instrument_provider, instrument_id)
+}
+
+/// Builds a LIMIT order whose *cross-venue* time-in-force is GTC while the IB-specific
+/// `IBOrderTags` overlay requests IBKR `Minutes`: the wire time-in-force must come from the
+/// IB-specific input, never from the core Nautilus enum.
+fn wp2_limit_order(client_order_id: &str, tags: Vec<Ustr>) -> OrderAny {
+    OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from(WP2_TRADER_ID))
+        .strategy_id(StrategyId::from(WP2_STRATEGY_ID))
+        .instrument_id(equity_aapl().id())
+        .client_order_id(ClientOrderId::from(client_order_id))
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from(1))
+        .time_in_force(TimeInForce::Gtc)
+        .tags(tags)
+        .submit(true)
+        .build()
+}
+
+fn wp2_submit_order(order: &OrderAny) -> SubmitOrder {
+    SubmitOrder::new(
+        TraderId::from(WP2_TRADER_ID),
+        None,
+        StrategyId::from(WP2_STRATEGY_ID),
+        order.instrument_id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::new(2),
+        None,
+    )
+}
+
+async fn wp2_submit_single(
+    cmd: &SubmitOrder,
+    transmission: &FakeOrderTransmission,
+    state: &SubmitTrackingState,
+    instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+    next_order_id: &Arc<Mutex<i32>>,
+    exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+) -> anyhow::Result<()> {
+    let order_submit_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    InteractiveBrokersExecutionClient::handle_submit_order_async(
+        cmd,
+        transmission,
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        next_order_id,
+        instrument_provider,
+        exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+        AccountId::from(WP2_ACCOUNT_ID),
+        &order_submit_lock,
+    )
+    .await
+}
+
+async fn wp2_submit_list(
+    cmd: &SubmitOrderList,
+    orders: &[OrderAny],
+    transmission: &FakeOrderTransmission,
+    state: &SubmitTrackingState,
+    instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+    next_order_id: &Arc<Mutex<i32>>,
+    exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+) -> anyhow::Result<()> {
+    let order_submit_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    InteractiveBrokersExecutionClient::handle_submit_order_list_async(
+        cmd,
+        orders,
+        transmission,
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        next_order_id,
+        instrument_provider,
+        exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+        AccountId::from(WP2_ACCOUNT_ID),
+        StrategyId::from(WP2_STRATEGY_ID),
+        &order_submit_lock,
+    )
+    .await
+}
+
+fn wp2_order_status(order_id: i32, status: &str, perm_id: i64) -> IBOrderStatus {
+    let mut order_status = create_test_order_status(order_id, status);
+    order_status.perm_id = perm_id;
+    order_status
+}
+
+async fn wp2_process_status(
+    order_status: &IBOrderStatus,
+    state: &SubmitTrackingState,
+    exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+) {
+    InteractiveBrokersExecutionClient::handle_order_status(
+        order_status,
+        &state.order_id_map,
+        &state.venue_order_id_map,
+        &create_test_instrument_provider(),
+        exec_sender,
+        UnixNanos::new(27),
+        AccountId::from("IB-001"),
+        &state.instrument_id_map,
+        &state.trader_id_map,
+        &state.strategy_id_map,
+        &state.active_order_contexts,
+        &state.terminal_order_contexts,
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(ahash::AHashSet::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+    )
+    .await
+    .unwrap();
+}
+
+/// R2-A8: a successful socket send is transmission, not broker acknowledgement.
+///
+/// The submitted order is transmitted with the exact IB-specific `Minutes` time-in-force
+/// (R2-A12/R2-A13), emits exactly one `OrderSubmitted`, and emits no `OrderAccepted`; broker
+/// order identity tracking stays coherent with no accepted flag set.
+#[tokio::test]
+async fn test_submit_order_send_success_emits_submitted_without_any_acceptance() {
+    let (instrument_provider, instrument_id) = wp2_instrument_provider();
+    let state = SubmitTrackingState::new();
+    let transmission = FakeOrderTransmission::sent();
+    let next_order_id = Arc::new(Mutex::new(9100));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let client_order_id = ClientOrderId::from("O-WP2-SINGLE");
+    let order = wp2_limit_order(client_order_id.as_str(), wp2_minutes_tags());
+    let cmd = wp2_submit_order(&order);
+
+    wp2_submit_single(
+        &cmd,
+        &transmission,
+        &state,
+        &instrument_provider,
+        &next_order_id,
+        &exec_sender,
+    )
+    .await
+    .unwrap();
+
+    match next_order_event(&mut exec_receiver) {
+        OrderEventAny::Submitted(event) => {
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.instrument_id, instrument_id);
+            assert_eq!(event.account_id, AccountId::from(WP2_ACCOUNT_ID));
+        }
+        event => panic!("Expected submitted order event, was {event:?}"),
+    }
+    assert!(
+        exec_receiver.try_recv().is_err(),
+        "a successful socket send must not emit OrderAccepted (or any other order event)"
+    );
+
+    let transmitted = transmission.transmitted_orders();
+    assert_eq!(transmitted.len(), 1, "exactly one transmission per submit");
+    let (ib_order_id, _, ib_order) = &transmitted[0];
+    assert_eq!(ib_order.order_ref, client_order_id.as_str());
+    assert_eq!(ib_order.tif, ibapi::orders::TimeInForce::Minutes);
+    assert_eq!(
+        ib_order.tif.to_string(),
+        "Minutes",
+        "the transmitted Order.tif value must be exactly `Minutes`"
+    );
+
+    state.assert_active(
+        *ib_order_id,
+        client_order_id,
+        instrument_id,
+        TraderId::from(WP2_TRADER_ID),
+        StrategyId::from(WP2_STRATEGY_ID),
+        false,
+    );
+    assert!(*next_order_id.lock() == ib_order_id + 1);
+}
+
+/// R2-A9 / R2-A10: authoritative `Submitted` and `PreSubmitted` callbacks emit exactly one
+/// `OrderAccepted`, carrying the callback-derived venue order identity, and duplicate accepted
+/// callbacks never duplicate the acceptance event.
+#[tokio::test]
+async fn test_authoritative_submitted_and_presubmitted_callbacks_accept_once_each() {
+    for status in ["Submitted", "PreSubmitted"] {
+        let state = SubmitTrackingState::new();
+        let order_id = 7401;
+        let client_order_id = ClientOrderId::from("O-WP2-CALLBACK");
+        let instrument_id = equity_aapl().id();
+        let trader_id = TraderId::from(WP2_TRADER_ID);
+        let strategy_id = StrategyId::from(WP2_STRATEGY_ID);
+        let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.cache(
+            order_id,
+            client_order_id,
+            instrument_id,
+            trader_id,
+            strategy_id,
+        );
+
+        let order_status = wp2_order_status(order_id, status, 555);
+        wp2_process_status(&order_status, &state, &exec_sender).await;
+
+        match next_order_event(&mut exec_receiver) {
+            OrderEventAny::Accepted(event) => {
+                assert_eq!(event.client_order_id, client_order_id);
+                assert_eq!(event.instrument_id, instrument_id);
+                assert_eq!(
+                    event.venue_order_id,
+                    VenueOrderId::from("PERM-555"),
+                    "acceptance must carry the authoritative broker venue order identity"
+                );
+                assert_eq!(event.ts_event, UnixNanos::new(27));
+            }
+            event => panic!("Expected accepted order event for {status}, was {event:?}"),
+        }
+
+        // Duplicate accepted callbacks must not duplicate the acceptance event.
+        wp2_process_status(&order_status, &state, &exec_sender).await;
+        assert!(
+            exec_receiver.try_recv().is_err(),
+            "a duplicate accepted callback ({status}) must not emit a second OrderAccepted"
+        );
+
+        // A second accepted state for the same order is also deduplicated.
+        let other_status = if status == "Submitted" {
+            "PreSubmitted"
+        } else {
+            "Submitted"
+        };
+        wp2_process_status(
+            &wp2_order_status(order_id, other_status, 555),
+            &state,
+            &exec_sender,
+        )
+        .await;
+        assert!(
+            exec_receiver.try_recv().is_err(),
+            "acceptance must be deduplicated across authoritative accepted states"
+        );
+
+        state.assert_active(
+            order_id,
+            client_order_id,
+            instrument_id,
+            trader_id,
+            strategy_id,
+            true,
+        );
+    }
+}
+
+/// R2-A11: an authoritative broker rejection must not synthesize an acceptance first.
+#[tokio::test]
+async fn test_rejection_callback_does_not_synthesize_acceptance() {
+    let order_id = 7402;
+    let client_order_id = ClientOrderId::from("O-WP2-REJECTED");
+    let equity = equity_aapl();
+    let instrument_id = equity.id();
+    let instrument_provider = create_test_instrument_provider();
+    instrument_provider.insert_test_instrument(InstrumentAny::from(equity), 12345, 1);
+
+    let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let trader_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let strategy_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let active_order_contexts = Arc::new(Mutex::new(AHashMap::new()));
+    let terminal_order_contexts = Arc::new(Mutex::new(FifoCacheMap::new()));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut open_order = create_test_open_order(order_id, "PreSubmitted", client_order_id.as_str());
+    open_order.order.what_if = true;
+    open_order.order.total_quantity = 1.0;
+
+    order_id_map.lock().insert(client_order_id, order_id);
+    venue_order_id_map.lock().insert(order_id, client_order_id);
+    instrument_id_map.lock().insert(order_id, instrument_id);
+    trader_id_map
+        .lock()
+        .insert(order_id, TraderId::from(WP2_TRADER_ID));
+    strategy_id_map
+        .lock()
+        .insert(order_id, StrategyId::from(WP2_STRATEGY_ID));
+    active_order_contexts.lock().insert(
+        order_id,
+        create_tracked_order_context(client_order_id, instrument_id),
+    );
+
+    InteractiveBrokersExecutionClient::handle_order_update(
+        &OrderUpdate::OpenOrder(open_order),
+        &order_id_map,
+        &venue_order_id_map,
+        &instrument_provider,
+        &exec_sender,
+        nautilus_core::time::get_atomic_clock_realtime(),
+        AccountId::from("IB-001"),
+        &Arc::new(Mutex::new(CommissionCache::new())),
+        &instrument_id_map,
+        &trader_id_map,
+        &strategy_id_map,
+        &active_order_contexts,
+        &terminal_order_contexts,
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(AHashMap::new())),
+        &Arc::new(Mutex::new(ahash::AHashSet::new())),
+        &Arc::new(Mutex::new(PendingExecutionCache::new())),
+    )
+    .await
+    .unwrap();
+
+    match next_order_event(&mut exec_receiver) {
+        OrderEventAny::Rejected(event) => {
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.instrument_id, instrument_id);
+        }
+        event => panic!("Expected rejected order event, was {event:?}"),
+    }
+    assert!(
+        exec_receiver.try_recv().is_err(),
+        "a broker rejection must not synthesize an OrderAccepted"
+    );
+    assert!(
+        !active_order_contexts
+            .lock()
+            .get(&order_id)
+            .expect("tracked context")
+            .accepted,
+        "a rejected order must not be marked accepted"
+    );
+}
+
+/// A terminal callback for an order that already carries an authoritative acceptance must not
+/// duplicate the acceptance event, and the terminal identity must remain accepted.
+#[tokio::test]
+async fn test_terminal_callback_does_not_duplicate_prior_acceptance() {
+    let state = SubmitTrackingState::new();
+    let order_id = 7403;
+    let client_order_id = ClientOrderId::from("O-WP2-TERMINAL");
+    let instrument_id = equity_aapl().id();
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.cache(
+        order_id,
+        client_order_id,
+        instrument_id,
+        TraderId::from(WP2_TRADER_ID),
+        StrategyId::from(WP2_STRATEGY_ID),
+    );
+
+    wp2_process_status(
+        &wp2_order_status(order_id, "Submitted", 777),
+        &state,
+        &exec_sender,
+    )
+    .await;
+    assert!(matches!(
+        next_order_event(&mut exec_receiver),
+        OrderEventAny::Accepted(_)
+    ));
+
+    wp2_process_status(
+        &wp2_order_status(order_id, "Filled", 777),
+        &state,
+        &exec_sender,
+    )
+    .await;
+    assert!(
+        exec_receiver.try_recv().is_err(),
+        "a terminal callback must not duplicate an already emitted OrderAccepted"
+    );
+
+    let terminal_contexts = state.terminal_order_contexts.lock();
+    let terminal_context = terminal_contexts.get(&order_id).expect("terminal context");
+    assert!(terminal_context.accepted);
+    assert_eq!(terminal_context.client_order_id, client_order_id);
+}
+
+/// A terminal `Filled` callback that arrives before any accepted callback still yields exactly
+/// one acceptance, derived from the authoritative broker terminal state and carrying the
+/// broker's venue order identity (which locally inferred acceptance could never produce).
+#[tokio::test]
+async fn test_terminal_first_callback_accepts_once_from_broker_identity() {
+    let state = SubmitTrackingState::new();
+    let order_id = 7404;
+    let client_order_id = ClientOrderId::from("O-WP2-TERMINAL-FIRST");
+    let instrument_id = equity_aapl().id();
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.cache(
+        order_id,
+        client_order_id,
+        instrument_id,
+        TraderId::from(WP2_TRADER_ID),
+        StrategyId::from(WP2_STRATEGY_ID),
+    );
+
+    wp2_process_status(
+        &wp2_order_status(order_id, "Filled", 888),
+        &state,
+        &exec_sender,
+    )
+    .await;
+
+    match next_order_event(&mut exec_receiver) {
+        OrderEventAny::Accepted(event) => {
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.venue_order_id, VenueOrderId::from("PERM-888"));
+        }
+        event => panic!("Expected accepted order event, was {event:?}"),
+    }
+    assert!(exec_receiver.try_recv().is_err());
+
+    // A late duplicate terminal callback must not emit a second acceptance.
+    wp2_process_status(
+        &wp2_order_status(order_id, "Filled", 888),
+        &state,
+        &exec_sender,
+    )
+    .await;
+    assert!(
+        exec_receiver.try_recv().is_err(),
+        "a duplicate terminal callback must not emit a second OrderAccepted"
+    );
+}
+
+/// R2-A8 fail-closed: a definitive transmission failure emits no acceptance and removes the
+/// attempted order tracking, while still reporting the local submission attempt.
+#[tokio::test]
+async fn test_submit_order_send_failure_fails_closed_without_acceptance() {
+    let (instrument_provider, _) = wp2_instrument_provider();
+    let state = SubmitTrackingState::new();
+    let transmission = FakeOrderTransmission::not_sent();
+    let next_order_id = Arc::new(Mutex::new(9200));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let client_order_id = ClientOrderId::from("O-WP2-NOT-SENT");
+    let order = wp2_limit_order(client_order_id.as_str(), wp2_minutes_tags());
+    let cmd = wp2_submit_order(&order);
+
+    let result = wp2_submit_single(
+        &cmd,
+        &transmission,
+        &state,
+        &instrument_provider,
+        &next_order_id,
+        &exec_sender,
+    )
+    .await;
+
+    assert!(result.is_err(), "a definitive submit failure must surface");
+    assert!(transmission.transmitted_orders().is_empty());
+
+    match next_order_event(&mut exec_receiver) {
+        OrderEventAny::Submitted(event) => assert_eq!(event.client_order_id, client_order_id),
+        event => panic!("Expected submitted order event, was {event:?}"),
+    }
+    match next_order_event(&mut exec_receiver) {
+        OrderEventAny::Rejected(event) => {
+            assert_eq!(event.client_order_id, client_order_id);
+            assert!(event.reason.to_string().contains("Failed to submit order"));
+        }
+        event => panic!("Expected rejected order event, was {event:?}"),
+    }
+    assert!(
+        exec_receiver.try_recv().is_err(),
+        "a failed socket send must not emit OrderAccepted"
+    );
+
+    state.assert_absent(9200, client_order_id);
+}
+
+/// R2-A8 for the order-list route: every successfully transmitted child emits `OrderSubmitted`
+/// only, and the last child is the transmitting child, so no acceptance is inferred locally.
+#[tokio::test]
+async fn test_submit_order_list_send_success_emits_submitted_without_any_acceptance() {
+    let (instrument_provider, instrument_id) = wp2_instrument_provider();
+    let state = SubmitTrackingState::new();
+    let transmission = FakeOrderTransmission::sent();
+    let next_order_id = Arc::new(Mutex::new(9300));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let first_id = ClientOrderId::from("O-WP2-LIST-1");
+    let second_id = ClientOrderId::from("O-WP2-LIST-2");
+    let first = wp2_limit_order(first_id.as_str(), wp2_minutes_tags());
+    let second = wp2_limit_order(second_id.as_str(), wp2_minutes_tags());
+    let orders = vec![first, second];
+    let order_list = OrderList::new(
+        OrderListId::from("OL-WP2"),
+        instrument_id,
+        StrategyId::from(WP2_STRATEGY_ID),
+        vec![first_id, second_id],
+        UnixNanos::new(1),
+    );
+    let cmd = SubmitOrderList::new(
+        TraderId::from(WP2_TRADER_ID),
+        None,
+        StrategyId::from(WP2_STRATEGY_ID),
+        order_list,
+        orders
+            .iter()
+            .map(|order| order.init_event().clone())
+            .collect(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::new(2),
+        None,
+    );
+
+    wp2_submit_list(
+        &cmd,
+        &orders,
+        &transmission,
+        &state,
+        &instrument_provider,
+        &next_order_id,
+        &exec_sender,
+    )
+    .await
+    .unwrap();
+
+    for expected_client_order_id in [first_id, second_id] {
+        match next_order_event(&mut exec_receiver) {
+            OrderEventAny::Submitted(event) => {
+                assert_eq!(event.client_order_id, expected_client_order_id);
+            }
+            event => panic!("Expected submitted order event, was {event:?}"),
+        }
+    }
+    assert!(
+        exec_receiver.try_recv().is_err(),
+        "successful list transmission must not emit OrderAccepted for any child"
+    );
+
+    let transmitted = transmission.transmitted_orders();
+    assert_eq!(transmitted.len(), 2);
+    for (index, (ib_order_id, _, ib_order)) in transmitted.iter().enumerate() {
+        let expected_client_order_id = if index == 0 { first_id } else { second_id };
+        assert_eq!(ib_order.order_ref, expected_client_order_id.as_str());
+        assert_eq!(ib_order.tif, ibapi::orders::TimeInForce::Minutes);
+        assert_eq!(ib_order.tif.to_string(), "Minutes");
+        assert_eq!(
+            ib_order.transmit,
+            index == 1,
+            "only the last child transmits"
+        );
+        state.assert_active(
+            *ib_order_id,
+            expected_client_order_id,
+            instrument_id,
+            TraderId::from(WP2_TRADER_ID),
+            StrategyId::from(WP2_STRATEGY_ID),
+            false,
+        );
+    }
+}
