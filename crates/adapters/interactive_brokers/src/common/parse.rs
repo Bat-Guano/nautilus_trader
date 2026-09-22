@@ -1669,4 +1669,47 @@ mod tests {
         assert!(contract.currency.as_str().is_empty());
         assert!(contract.local_symbol.is_empty());
     }
+
+    /// C2.10-E2-R2 regression: `SPY.SMART` is NOT the SPY equity
+    /// qualification instrument.
+    ///
+    /// `SMART` is in `VENUES_CFD`, and that branch is evaluated before the
+    /// "Default to Stock (STK)" branch, so `SPY.SMART` maps to a CFD.  The
+    /// CFD venue handling is deliberately NOT changed by this slice (it may
+    /// serve valid CFD identifiers); this regression records the behaviour so
+    /// that the equity qualification cannot silently drift back to it.
+    #[rstest]
+    fn test_instrument_id_to_ib_contract_smart_venue_is_not_the_spy_equity() {
+        let contract = instrument_id_to_ib_contract(InstrumentId::from("SPY.SMART"), None).unwrap();
+
+        assert_eq!(
+            contract.security_type,
+            SecurityType::CFD,
+            "SPY.SMART resolves through the CFD venue branch, never as a stock"
+        );
+        assert_ne!(contract.security_type, SecurityType::Stock);
+    }
+
+    /// C2.10-E2-R2: the bounded SPY equity qualification identity is
+    /// `SPY.ARCA`, which maps through the accepted stock route - `ARCA` is
+    /// NOT a CFD venue, so the venue segment falls through to the
+    /// "Default to Stock (STK)" branch and the request contract is routed on
+    /// SMART.
+    ///
+    /// Note on the primary exchange: `ARCA` is not a key of `VENUE_MEMBERS`
+    /// (that table keys on `ARCX`), so `derived_exchange` falls back to
+    /// `SMART` and the *request* contract carries `primary_exchange = SMART`.
+    /// The venue identity that matters for this slice is the Nautilus
+    /// `InstrumentId` venue (`ARCA`), which is preserved onto the resolved
+    /// `Equity` instrument, and the primary exchange IB echoes back on the
+    /// *response* contract details, which `parse_equity_contract` consumes.
+    #[rstest]
+    fn test_instrument_id_to_ib_contract_arca_venue_is_the_spy_equity() {
+        let contract = instrument_id_to_ib_contract(InstrumentId::from("SPY.ARCA"), None).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Stock);
+        assert_ne!(contract.security_type, SecurityType::CFD);
+        assert_eq!(contract.exchange.as_str(), "SMART");
+        assert_eq!(contract.symbol.as_str(), "SPY");
+    }
 }

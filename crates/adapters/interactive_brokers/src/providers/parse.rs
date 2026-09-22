@@ -39,6 +39,99 @@ use crate::common::{
 
 const NINETY_DAYS: DurationNanos = DurationNanos::from_days(90);
 
+/// The size precision an equity instrument carries, and therefore the only
+/// precision at which a native minimum order size may be published for one.
+///
+/// `Equity::size_precision()` is `0` (whole shares).  Publishing a minimum at
+/// any other precision would advertise a minimum the instrument itself cannot
+/// represent.
+const EQUITY_SIZE_PRECISION: u8 = 0;
+
+/// The `info` provenance value recording that the minimum quantity came from
+/// the native contract-details field.
+const MIN_QUANTITY_SOURCE_NATIVE: &str = "contract_details.min_size";
+
+/// The `info` provenance value recording that the native field was absent.
+const MIN_QUANTITY_SOURCE_MISSING: &str = "contract_details.min_size.missing";
+
+/// The `info` provenance value recording a native `min_size` that was not a
+/// finite number (`NaN` or an infinity).
+const MIN_QUANTITY_SOURCE_NON_FINITE: &str = "contract_details.min_size.non_finite";
+
+/// The `info` provenance value recording a native `min_size` of zero or less.
+const MIN_QUANTITY_SOURCE_NON_POSITIVE: &str = "contract_details.min_size.non_positive";
+
+/// The `info` provenance value recording a native `min_size` with a fractional
+/// part, which the whole-share equity model cannot represent.
+const MIN_QUANTITY_SOURCE_FRACTIONAL: &str =
+    "contract_details.min_size.fractional_not_representable";
+
+/// The `info` provenance value recording a native `min_size` that is positive
+/// and whole but still not representable as an equity [`Quantity`] (below the
+/// smallest representable whole share, or outside the model's range).
+const MIN_QUANTITY_SOURCE_UNREPRESENTABLE: &str =
+    "contract_details.min_size.not_representable_at_equity_precision";
+
+/// Native minimum order size from the IB contract-details response, resolved to
+/// an equity minimum quantity **only when the native value is usable**.
+///
+/// C2.10-E2-R2-R1.  The earlier revision of this function manufactured a
+/// one-share minimum whenever the native value was missing or unusable, and
+/// pushed every positive value through `Quantity::new(native, 0)`.
+/// Both behaviours were wrong:
+///
+/// * a manufactured minimum is not a fact from the venue, and nothing in the
+///   adapter positively establishes that an arbitrary equity contract is
+///   eligible for a one-share minimum; and
+/// * `Quantity::new(value, 0)` silently ROUNDS to the requested precision
+///   (`f64_to_fixed_u128` does `(value * 10^precision).round()`), so a
+///   fractional native minimum would have been misrepresented as a whole
+///   share - `0.5` becomes `1`, `1.5` becomes `2`.  `Quantity::new` also
+///   PANICS outside `[QUANTITY_MIN, QUANTITY_MAX]`.
+///
+/// The rule is therefore: publish a minimum ONLY for a native `min_size` that
+/// is finite, strictly positive, exactly whole, and representable by the model
+/// at the instrument's own size precision.  Everything else publishes NO
+/// minimum and records why in `info["minQuantitySource"]`, so the existing
+/// instrument-legality gate refuses the request instead of a value being
+/// invented or rounded.  Nothing is ever inferred from `lot_size`,
+/// `size_increment` or `suggested_size_increment`, and no symbol-specific
+/// logic exists here.
+#[must_use]
+fn equity_min_quantity(
+    details: &ibapi::contracts::ContractDetails,
+) -> (Option<Quantity>, &'static str) {
+    let native = details.min_size;
+
+    if native == 0.0 {
+        // Covers both an unset protobuf field (the default `f64` is 0.0) and
+        // an explicit zero, which are indistinguishable on the wire.
+        return (None, MIN_QUANTITY_SOURCE_MISSING);
+    }
+
+    if !native.is_finite() {
+        return (None, MIN_QUANTITY_SOURCE_NON_FINITE);
+    }
+
+    if native < 0.0 {
+        return (None, MIN_QUANTITY_SOURCE_NON_POSITIVE);
+    }
+
+    if native.fract() != 0.0 {
+        // Fractional-share trading is explicitly NOT claimed by this adapter,
+        // and the equity model has no precision to carry a fraction.
+        return (None, MIN_QUANTITY_SOURCE_FRACTIONAL);
+    }
+
+    // Let the model itself decide representability rather than re-deriving its
+    // bounds here.  `new_checked` is the non-panicking door, and it also
+    // catches a positive whole value that would round down to zero.
+    match Quantity::new_checked(native, EQUITY_SIZE_PRECISION) {
+        Ok(quantity) if !quantity.is_zero() => (Some(quantity), MIN_QUANTITY_SOURCE_NATIVE),
+        _ => (None, MIN_QUANTITY_SOURCE_UNREPRESENTABLE),
+    }
+}
+
 /// Convert tick size to precision value.
 #[must_use]
 pub fn tick_size_to_precision(tick_size: f64) -> u8 {
@@ -237,15 +330,51 @@ fn parse_equity_contract(
     let price_precision = tick_size_to_precision(details.min_tick);
     let timestamp = get_atomic_clock_realtime().get_time_ns();
 
+    // C2.10-E2-R2 / R1: the equity minimum executable quantity is propagated
+    // from the native IB contract-details response, and ONLY when that native
+    // value is usable as a whole-share minimum.  The builder never set
+    // `min_quantity` before this correction, so `Equity::min_quantity` stayed
+    // `None`, the instrument-legality gate downstream could not establish the
+    // legality of any quantity, and EVERY equity request was refused before
+    // submission.  When the native metadata is absent or unusable the field is
+    // deliberately left absent again, so that gate refuses instead of a value
+    // being invented, rounded or inferred from another field.
+    // `price_precision`, `price_increment`, `lot_size` (the round lot) and the
+    // instrument identity are unchanged.
+    let (min_quantity, min_quantity_source) = equity_min_quantity(details);
+
+    let mut info = ib_contract_info(details);
+    info.insert(
+        "minSize".to_string(),
+        serde_json::Value::from(details.min_size),
+    );
+    info.insert(
+        "sizeIncrement".to_string(),
+        serde_json::Value::from(details.size_increment),
+    );
+    info.insert(
+        "suggestedSizeIncrement".to_string(),
+        serde_json::Value::from(details.suggested_size_increment),
+    );
+    info.insert(
+        "minQuantitySource".to_string(),
+        serde_json::Value::from(min_quantity_source),
+    );
+
     let instrument = Equity::builder()
         .instrument_id(instrument_id)
         .raw_symbol(Symbol::from(details.contract.local_symbol.as_str()))
         .currency(Currency::from(details.contract.currency.to_string()))
         .price_precision(price_precision)
         .price_increment(Price::new(details.min_tick, price_precision))
+        // `None` (absent or unusable native metadata) leaves `min_quantity`
+        // UNSET, which is the deliberate fail-closed outcome: the downstream
+        // instrument-legality gate then refuses any quantity for this
+        // instrument instead of a minimum being manufactured for it.
+        .maybe_min_quantity(min_quantity)
         // Standard lot size for stocks
         .lot_size(Quantity::new(100.0, 0))
-        .info(ib_contract_info(details))
+        .info(info)
         .ts_event(timestamp)
         .ts_init(timestamp)
         .build()
@@ -465,10 +594,18 @@ mod tests {
     use nautilus_model::{
         enums::AssetClass,
         identifiers::{InstrumentId, Symbol as NautilusSymbol, Venue},
-        instruments::{Instrument, InstrumentAny},
+        instruments::{Equity, Instrument, InstrumentAny},
         types::{Price, Quantity},
     };
     use rstest::rstest;
+
+    // C2.10-E2-R2-R1: the provenance labels the parser publishes, so the tests
+    // assert the EXACT reason an unusable native minimum was not published.
+    use super::{
+        MIN_QUANTITY_SOURCE_FRACTIONAL, MIN_QUANTITY_SOURCE_MISSING, MIN_QUANTITY_SOURCE_NATIVE,
+        MIN_QUANTITY_SOURCE_NON_FINITE, MIN_QUANTITY_SOURCE_NON_POSITIVE,
+        MIN_QUANTITY_SOURCE_UNREPRESENTABLE,
+    };
     use ustr::Ustr;
 
     use super::{
@@ -537,6 +674,374 @@ mod tests {
         assert_eq!(
             equity.info.unwrap().get("priceMagnifier"),
             Some(&serde_json::Value::from(100))
+        );
+    }
+
+    // ------------------------------------------------------------------- //
+    // C2.10-E2-R2: native equity minimum-quantity propagation              //
+    // ------------------------------------------------------------------- //
+    //
+    // The IB contract-details response carries `min_size` ("Order's minimal
+    // size"), `size_increment` and `suggested_size_increment`.  The accepted
+    // `parse_equity_contract` dropped all three, so every resolved equity
+    // published `min_quantity = None` and no equity request could establish
+    // quantity legality.  These tests pin the propagation.
+
+    /// A US stock/ETF `ContractDetails` as the `SecurityType::Stock` path
+    /// receives it from the IB protobuf contract-details response.
+    fn stock_details(
+        symbol: &str,
+        local_symbol: &str,
+        primary_exchange: &str,
+        min_size: f64,
+    ) -> ContractDetails {
+        ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from(symbol),
+                security_type: SecurityType::Stock,
+                exchange: Exchange::from("SMART"),
+                primary_exchange: Exchange::from(primary_exchange),
+                currency: Currency::from("USD"),
+                local_symbol: local_symbol.to_string(),
+                ..Default::default()
+            },
+            min_tick: 0.01,
+            min_size,
+            size_increment: 1.0,
+            suggested_size_increment: 100.0,
+            ..Default::default()
+        }
+    }
+
+    fn stock_details_with_increments(
+        symbol: &str,
+        primary_exchange: &str,
+        min_size: f64,
+        size_increment: f64,
+        suggested_size_increment: f64,
+    ) -> ContractDetails {
+        ContractDetails {
+            size_increment,
+            suggested_size_increment,
+            ..stock_details(symbol, symbol, primary_exchange, min_size)
+        }
+    }
+
+    fn stock_equity(symbol: &str, primary_exchange: &str, min_size: f64) -> (Equity, InstrumentId) {
+        let details = stock_details(symbol, symbol, primary_exchange, min_size);
+        let instrument_id =
+            InstrumentId::new(NautilusSymbol::from(symbol), Venue::from(primary_exchange));
+        let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+        let InstrumentAny::Equity(equity) = instrument else {
+            panic!("expected equity for {symbol}.{primary_exchange}");
+        };
+        (equity, instrument_id)
+    }
+
+    #[rstest]
+    #[case("SPY", "ARCA")]
+    #[case("AAPL", "NASDAQ")]
+    #[case("MSFT", "NASDAQ")]
+    fn test_parse_equity_contract_publishes_native_min_quantity(
+        #[case] symbol: &str,
+        #[case] primary_exchange: &str,
+    ) {
+        let (equity, instrument_id) = stock_equity(symbol, primary_exchange, 1.0);
+
+        assert_eq!(equity.asset_class(), AssetClass::Equity);
+        assert_eq!(equity.id, instrument_id);
+        // The native minimum size is ONE SHARE, taken from `min_size`, not
+        // from the round-lot `lot_size` of 100 and not from
+        // `suggested_size_increment` of 100.
+        assert_eq!(
+            equity.min_quantity(),
+            Some(Quantity::new(1.0, 0)),
+            "the resolved equity must publish the native contract-details \
+             minimum order size"
+        );
+    }
+
+    #[rstest]
+    fn test_parse_equity_contract_min_quantity_precision_matches_instrument() {
+        let (equity, _) = stock_equity("SPY", "ARCA", 1.0);
+        let min_quantity = equity.min_quantity().expect("min_quantity published");
+
+        assert_eq!(min_quantity.precision, equity.size_precision());
+        assert_eq!(equity.size_precision(), 0);
+    }
+
+    #[rstest]
+    fn test_parse_equity_contract_preserves_price_increment_and_lot_size() {
+        let (equity, _) = stock_equity("SPY", "ARCA", 1.0);
+
+        // Unchanged by the correction.
+        assert_eq!(equity.price_precision(), 2);
+        assert_eq!(equity.price_increment(), Price::new(0.01, 2));
+        assert_eq!(equity.lot_size(), Some(Quantity::new(100.0, 0)));
+    }
+
+    #[rstest]
+    fn test_parse_equity_contract_does_not_substitute_lot_size_for_min_quantity() {
+        let (equity, _) = stock_equity("SPY", "ARCA", 1.0);
+
+        // A round lot (100) and the minimum executable size (1) are
+        // different concepts: the adapter must not silently substitute one
+        // for the other.
+        assert_ne!(equity.min_quantity(), equity.lot_size());
+        assert_eq!(equity.min_quantity(), Some(Quantity::new(1.0, 0)));
+        assert_eq!(equity.lot_size(), Some(Quantity::new(100.0, 0)));
+    }
+
+    #[rstest]
+    fn test_parse_equity_contract_records_native_min_size_provenance() {
+        let (equity, _) = stock_equity("SPY", "ARCA", 1.0);
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from("contract_details.min_size")),
+            "the minimum quantity must be traceable to the native field it \
+             came from"
+        );
+        assert_eq!(info.get("minSize"), Some(&serde_json::Value::from(1.0)),);
+        assert_eq!(
+            info.get("sizeIncrement"),
+            Some(&serde_json::Value::from(1.0)),
+        );
+        assert_eq!(
+            info.get("suggestedSizeIncrement"),
+            Some(&serde_json::Value::from(100.0)),
+        );
+    }
+
+    /// C2.10-E2-R2-R1 requirement 1: `min_size = 1.0` is the native minimum.
+    #[rstest]
+    #[case("SPY", "ARCA")]
+    #[case("AAPL", "NASDAQ")]
+    #[case("MSFT", "NASDAQ")]
+    fn test_parse_equity_contract_native_min_size_one_is_published(
+        #[case] symbol: &str,
+        #[case] primary_exchange: &str,
+    ) {
+        let (equity, _) = stock_equity(symbol, primary_exchange, 1.0);
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(equity.min_quantity(), Some(Quantity::new(1.0, 0)));
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(MIN_QUANTITY_SOURCE_NATIVE)),
+        );
+    }
+
+    /// C2.10-E2-R2-R1 requirement 2: another whole-share value stays EXACT.
+    #[rstest]
+    #[case(5.0, 5.0)]
+    #[case(100.0, 100.0)]
+    #[case(1.0, 1.0)]
+    fn test_parse_equity_contract_native_min_size_whole_value_is_exact(
+        #[case] min_size: f64,
+        #[case] expected: f64,
+    ) {
+        let (equity, _) = stock_equity("SPY", "ARCA", min_size);
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            equity.min_quantity(),
+            Some(Quantity::new(expected, 0)),
+            "a native whole-share minimum must be published EXACTLY, never \
+             rounded and never substituted"
+        );
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(MIN_QUANTITY_SOURCE_NATIVE)),
+        );
+    }
+
+    /// Requirements 3, 4, 6, 7: non-positive and non-finite native values must
+    /// NOT become a manufactured one-share minimum.  Each must leave the
+    /// minimum UNSET and record explicit invalid provenance.
+    #[rstest]
+    #[case(0.0, MIN_QUANTITY_SOURCE_MISSING)]
+    #[case(-1.0, MIN_QUANTITY_SOURCE_NON_POSITIVE)]
+    #[case(-0.5, MIN_QUANTITY_SOURCE_NON_POSITIVE)]
+    #[case(f64::NAN, MIN_QUANTITY_SOURCE_NON_FINITE)]
+    #[case(f64::INFINITY, MIN_QUANTITY_SOURCE_NON_FINITE)]
+    #[case(f64::NEG_INFINITY, MIN_QUANTITY_SOURCE_NON_FINITE)]
+    fn test_parse_equity_contract_invalid_native_min_size_leaves_minimum_unset(
+        #[case] min_size: f64,
+        #[case] expected_source: &str,
+    ) {
+        let (equity, _) = stock_equity("SPY", "ARCA", min_size);
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            equity.min_quantity(),
+            None,
+            "native min_size {min_size} must NOT produce a usable equity \
+             minimum; manufacturing one would state a venue fact that was \
+             never observed"
+        );
+        assert_ne!(
+            equity.min_quantity(),
+            Some(Quantity::new(1.0, 0)),
+            "the removed one-share fallback must not survive in any form"
+        );
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(expected_source)),
+            "unusable native metadata must record WHY no minimum was published"
+        );
+        // The raw native value is still recorded for diagnostics.  Note that
+        // `serde_json` maps NaN and the infinities to `Value::Null`, so the
+        // expectation is the JSON spelling, not the float.
+        if min_size.is_finite() {
+            assert_eq!(
+                info.get("minSize").and_then(serde_json::Value::as_f64),
+                Some(min_size),
+            );
+        } else {
+            assert_eq!(info.get("minSize"), Some(&serde_json::Value::Null));
+        }
+    }
+
+    /// Requirements 8 and 9: a FRACTIONAL native minimum must never be rounded
+    /// into a whole share.  `Quantity::new(0.5, 0)` would silently yield 1 and
+    /// `Quantity::new(1.5, 0)` would silently yield 2, because
+    /// `f64_to_fixed_u128` rounds to the requested precision.  This is the
+    /// defect the R1 correction removes.
+    #[rstest]
+    #[case(0.5)]
+    #[case(1.5)]
+    #[case(2.25)]
+    #[case(0.999)]
+    #[case(f64::MIN_POSITIVE)]
+    fn test_parse_equity_contract_fractional_native_min_size_is_never_rounded(
+        #[case] min_size: f64,
+    ) {
+        let (equity, _) = stock_equity("SPY", "ARCA", min_size);
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            equity.min_quantity(),
+            None,
+            "fractional native min_size {min_size} must not be published for a \
+             whole-share instrument"
+        );
+        // And specifically not the rounded whole share it would have become.
+        assert_ne!(equity.min_quantity(), Some(Quantity::new(1.0, 0)));
+        assert_ne!(equity.min_quantity(), Some(Quantity::new(2.0, 0)));
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(MIN_QUANTITY_SOURCE_FRACTIONAL)),
+        );
+        // No fractional-share support is claimed anywhere.
+        assert_eq!(equity.size_precision(), 0);
+    }
+
+    /// A positive whole value that the model cannot represent must fail closed
+    /// rather than PANIC `Quantity::new` or be silently clamped: `1.0e30` and
+    /// `f64::MAX` both exceed `QUANTITY_MAX`, and `Quantity::new` PANICS on
+    /// out-of-range input, so the non-panicking `new_checked` door is used.
+    #[rstest]
+    #[case(1.0e30)]
+    #[case(f64::MAX)]
+    fn test_parse_equity_contract_out_of_range_native_min_size_fails_closed(#[case] min_size: f64) {
+        let (equity, _) = stock_equity("SPY", "ARCA", min_size);
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(equity.min_quantity(), None);
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(
+                MIN_QUANTITY_SOURCE_UNREPRESENTABLE
+            )),
+        );
+    }
+
+    /// Requirement 10: `lot_size` (the round lot, 100) is a DIFFERENT concept
+    /// and stays exactly 100 for every native minimum, valid or not.
+    #[rstest]
+    #[case(1.0)]
+    #[case(5.0)]
+    #[case(0.0)]
+    #[case(-1.0)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[case(0.5)]
+    fn test_parse_equity_contract_lot_size_remains_distinct_and_unchanged(#[case] min_size: f64) {
+        let (equity, _) = stock_equity("SPY", "ARCA", min_size);
+
+        assert_eq!(equity.lot_size(), Some(Quantity::new(100.0, 0)));
+        assert_ne!(
+            equity.min_quantity(),
+            equity.lot_size(),
+            "the round lot must never be substituted for the minimum"
+        );
+    }
+
+    /// Requirement 11: neither `size_increment` nor
+    /// `suggested_size_increment` may be substituted for the minimum.
+    #[rstest]
+    #[case(1.0, 5.0, 250.0)]
+    #[case(5.0, 25.0, 500.0)]
+    fn test_parse_equity_contract_size_increments_are_not_substituted(
+        #[case] min_size: f64,
+        #[case] size_increment: f64,
+        #[case] suggested_size_increment: f64,
+    ) {
+        let details = stock_details_with_increments(
+            "SPY",
+            "ARCA",
+            min_size,
+            size_increment,
+            suggested_size_increment,
+        );
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+        let info = equity.info.clone().expect("instrument info");
+
+        // The published minimum is the native `min_size`, not either increment.
+        assert_eq!(equity.min_quantity(), Some(Quantity::new(min_size, 0)));
+        assert_ne!(
+            equity.min_quantity(),
+            Some(Quantity::new(size_increment, 0))
+        );
+        assert_ne!(
+            equity.min_quantity(),
+            Some(Quantity::new(suggested_size_increment, 0))
+        );
+        // And both increments are still recorded verbatim for auditability.
+        assert_eq!(
+            info.get("sizeIncrement"),
+            Some(&serde_json::Value::from(size_increment)),
+        );
+        assert_eq!(
+            info.get("suggestedSizeIncrement"),
+            Some(&serde_json::Value::from(suggested_size_increment)),
+        );
+    }
+
+    /// Requirement 11 (negative direction): with an UNUSABLE native minimum,
+    /// usable increments must not rescue it into a minimum.
+    #[rstest]
+    fn test_parse_equity_contract_increments_do_not_rescue_unusable_minimum() {
+        let details = stock_details_with_increments("SPY", "ARCA", 0.0, 1.0, 100.0);
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+
+        assert_eq!(
+            equity.min_quantity(),
+            None,
+            "size_increment=1 / suggested_size_increment=100 must NOT be \
+             promoted into a minimum quantity"
         );
     }
 
