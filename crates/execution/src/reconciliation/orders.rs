@@ -497,7 +497,17 @@ pub fn generate_external_order_status_events_with_commission(
     ));
 
     match report.order_status {
-        OrderStatus::Accepted | OrderStatus::Triggered => vec![accepted],
+        // C2.10-E2-R4 (D-3): a venue reporting `Submitted` for an order it already
+        // holds is reporting a live working order. It must not suppress the venue
+        // identity. The `Accepted` event above is the only event that stamps
+        // `report.venue_order_id` onto the order object, and that object - not the
+        // cache's separate client->venue ID map - is what `Strategy::cancel_order`
+        // reads when it builds `CancelOrder`. Without this arm a reconciled
+        // `SUBMITTED` order stays `INITIALIZED` with `venue_order_id() == None`,
+        // `CancelOrder` carries no venue identity, and a target-bound
+        // cancellation degrades to a session-local order-ID lookup that a
+        // reconstructing process cannot satisfy.
+        OrderStatus::Submitted | OrderStatus::Accepted | OrderStatus::Triggered => vec![accepted],
         OrderStatus::PartiallyFilled | OrderStatus::Filled => {
             let mut events = vec![accepted];
 

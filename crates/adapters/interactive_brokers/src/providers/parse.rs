@@ -61,75 +61,370 @@ const MIN_QUANTITY_SOURCE_NON_FINITE: &str = "contract_details.min_size.non_fini
 /// The `info` provenance value recording a native `min_size` of zero or less.
 const MIN_QUANTITY_SOURCE_NON_POSITIVE: &str = "contract_details.min_size.non_positive";
 
-/// The `info` provenance value recording a native `min_size` with a fractional
-/// part, which the whole-share equity model cannot represent.
-const MIN_QUANTITY_SOURCE_FRACTIONAL: &str =
-    "contract_details.min_size.fractional_not_representable";
-
-/// The `info` provenance value recording a native `min_size` that is positive
-/// and whole but still not representable as an equity [`Quantity`] (below the
-/// smallest representable whole share, or outside the model's range).
+/// The `info` provenance value recording a native `min_size` that could not be
+/// turned into a usable whole-share minimum at all: the exact decimal
+/// restatement overflowed, the common-scale integer arithmetic overflowed, the
+/// value falls outside the model's range, or it lies beyond the range in which
+/// an `f64` reproduces every integer exactly.
 const MIN_QUANTITY_SOURCE_UNREPRESENTABLE: &str =
     "contract_details.min_size.not_representable_at_equity_precision";
 
-/// Native minimum order size from the IB contract-details response, resolved to
-/// an equity minimum quantity **only when the native value is usable**.
+/// The `info` provenance value recording that the native `min_size` was
+/// NORMALIZED onto the system's whole-share increment: the smallest whole-share
+/// quantity at or above the native minimum was published, so the published
+/// value is strictly greater than the native one and the raw value is kept
+/// alongside it.
 ///
-/// C2.10-E2-R2-R1.  The earlier revision of this function manufactured a
-/// one-share minimum whenever the native value was missing or unusable, and
-/// pushed every positive value through `Quantity::new(native, 0)`.
-/// Both behaviours were wrong:
-///
-/// * a manufactured minimum is not a fact from the venue, and nothing in the
-///   adapter positively establishes that an arbitrary equity contract is
-///   eligible for a one-share minimum; and
-/// * `Quantity::new(value, 0)` silently ROUNDS to the requested precision
-///   (`f64_to_fixed_u128` does `(value * 10^precision).round()`), so a
-///   fractional native minimum would have been misrepresented as a whole
-///   share - `0.5` becomes `1`, `1.5` becomes `2`.  `Quantity::new` also
-///   PANICS outside `[QUANTITY_MIN, QUANTITY_MAX]`.
-///
-/// The rule is therefore: publish a minimum ONLY for a native `min_size` that
-/// is finite, strictly positive, exactly whole, and representable by the model
-/// at the instrument's own size precision.  Everything else publishes NO
-/// minimum and records why in `info["minQuantitySource"]`, so the existing
-/// instrument-legality gate refuses the request instead of a value being
-/// invented or rounded.  Nothing is ever inferred from `lot_size`,
-/// `size_increment` or `suggested_size_increment`, and no symbol-specific
-/// logic exists here.
-#[must_use]
-fn equity_min_quantity(
-    details: &ibapi::contracts::ContractDetails,
-) -> (Option<Quantity>, &'static str) {
-    let native = details.min_size;
+/// C2.10-E2-R3-Q2.  This is a NARROWING of the venue's constraint, never a
+/// relaxation: the published minimum is always `>=` the native minimum, and the
+/// native minimum is always a legal quantity of the system increment.
+const MIN_QUANTITY_SOURCE_NORMALIZED: &str =
+    "contract_details.min_size.ceiling_to_system_size_increment";
 
-    if native == 0.0 {
+/// The `info` provenance value recording that the native `size_increment` was
+/// absent (or an unset field, indistinguishable from an explicit zero).
+///
+/// A minimum cannot be normalized without knowing the lattice the venue trades
+/// on, so an absent increment fails closed even when `min_size` is usable.
+const MIN_QUANTITY_SOURCE_INCREMENT_MISSING: &str = "contract_details.size_increment.missing";
+
+/// The `info` provenance value recording a native `size_increment` that was not
+/// a finite number.
+const MIN_QUANTITY_SOURCE_INCREMENT_NON_FINITE: &str = "contract_details.size_increment.non_finite";
+
+/// The `info` provenance value recording a native `size_increment` of zero or
+/// less.
+const MIN_QUANTITY_SOURCE_INCREMENT_NON_POSITIVE: &str =
+    "contract_details.size_increment.non_positive";
+
+/// The `info` provenance value recording that the system's whole-share
+/// increment does NOT lie on the venue's `size_increment` lattice, so the
+/// system could not express its own one-share step as a whole number of venue
+/// increments.  The alignment required for a safe normalization cannot be
+/// proven, so nothing is published.
+const MIN_QUANTITY_SOURCE_INCREMENT_INCOMPATIBLE: &str =
+    "contract_details.size_increment.system_increment_not_on_lattice";
+
+/// The `info` provenance value recording that the native `min_size` is not
+/// itself a whole number of venue increments, i.e. the venue's own two
+/// constraint fields are mutually inconsistent.  Nothing is inferred from
+/// inconsistent metadata.
+const MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE: &str =
+    "contract_details.min_size.not_on_size_increment_lattice";
+
+/// The number of shares the system's whole-share equity model steps by.
+///
+/// `Equity::size_precision()` is `0`, so the smallest quantity the model can
+/// express is exactly one share.  This is a property of the SYSTEM, not a fact
+/// read from the venue, and it is the only system increment this adapter
+/// normalizes onto.
+const EQUITY_SYSTEM_SIZE_INCREMENT_SHARES: i128 = 1;
+
+/// The `info` key recording the exact raw venue minimum order size.
+const INFO_KEY_RAW_MIN_SIZE: &str = "minQuantityRawMinSize";
+
+/// The `info` key recording the exact raw venue size increment.
+const INFO_KEY_RAW_SIZE_INCREMENT: &str = "minQuantityRawSizeIncrement";
+
+/// The `info` key recording the effective system minimum order quantity.
+const INFO_KEY_EFFECTIVE_MIN_QUANTITY: &str = "minQuantityEffective";
+
+/// The `info` key recording the system increment the minimum was normalized to.
+const INFO_KEY_SYSTEM_SIZE_INCREMENT: &str = "minQuantitySystemIncrement";
+
+/// The `info` key recording the human-readable normalization rule.
+const INFO_KEY_NORMALIZATION_RULE: &str = "minQuantityNormalizationRule";
+
+/// Native minimum order size from the IB contract-details response, normalized
+/// into the whole-share domain the equity model can actually express.
+///
+/// C2.10-E2-R3-Q2.  The previous revision refused EVERY fractional native
+/// minimum, which is correct about not rounding but wrong about the venue: real
+/// equity contracts report a fractional `min_size` (live SPY reports `0.0001`)
+/// together with an equally fractional `size_increment`, and refusing those
+/// blocked every equity order outright.
+///
+/// The rule implemented here is a CEILING onto the system's one-share
+/// increment, proven with exact decimal arithmetic:
+///
+/// 1. the native `min_size` must be present, finite and strictly positive;
+/// 2. the native `size_increment` must be present, finite and strictly positive;
+/// 3. both are restated EXACTLY as decimals (Rust's shortest round-tripping
+///    `f64` rendering) and re-expressed at a common scale as integers, so all
+///    subsequent arithmetic is exact integer arithmetic - no floating point and
+///    no `Decimal` division appear anywhere below this point;
+/// 4. the system's one-share increment must lie ON the venue's increment
+///    lattice (`system % increment == 0`), otherwise alignment cannot be proven;
+/// 5. the native minimum must itself be a whole number of venue increments,
+///    otherwise the venue's own two fields disagree and nothing is inferred;
+/// 6. the effective minimum is the smallest whole-share quantity at or ABOVE
+///    the native minimum - a ceiling, never a nearest-value rounding, so the
+///    published minimum can only ever narrow the venue's constraint;
+/// 7. the result must be representable by the equity model at its own size
+///    precision (`0`), and the share count must be small enough that an `f64`
+///    reproduces it exactly;
+/// 8. minimality and the lower bound are re-proved on the computed value rather
+///    than assumed from the formula.
+///
+/// Every refusal publishes `None` and records WHY in
+/// `info["minQuantitySource"]`.  Nothing is ever inferred from `lot_size` or
+/// `suggested_size_increment`, `suggested_size_increment` is never treated as a
+/// minimum or a mandatory increment, and no symbol-specific logic exists.
+#[must_use]
+fn equity_min_quantity(details: &ibapi::contracts::ContractDetails) -> EquityMinQuantity {
+    let native_min = details.min_size;
+    let native_increment = details.size_increment;
+
+    // --- 1. the native minimum ------------------------------------------- //
+    if native_min == 0.0 {
         // Covers both an unset protobuf field (the default `f64` is 0.0) and
         // an explicit zero, which are indistinguishable on the wire.
-        return (None, MIN_QUANTITY_SOURCE_MISSING);
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_MISSING);
     }
 
-    if !native.is_finite() {
-        return (None, MIN_QUANTITY_SOURCE_NON_FINITE);
+    if !native_min.is_finite() {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_NON_FINITE);
     }
 
-    if native < 0.0 {
-        return (None, MIN_QUANTITY_SOURCE_NON_POSITIVE);
+    if native_min < 0.0 {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_NON_POSITIVE);
     }
 
-    if native.fract() != 0.0 {
-        // Fractional-share trading is explicitly NOT claimed by this adapter,
-        // and the equity model has no precision to carry a fraction.
-        return (None, MIN_QUANTITY_SOURCE_FRACTIONAL);
+    // --- 2. the native increment ----------------------------------------- //
+    if native_increment == 0.0 {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_INCREMENT_MISSING);
     }
 
-    // Let the model itself decide representability rather than re-deriving its
-    // bounds here.  `new_checked` is the non-panicking door, and it also
-    // catches a positive whole value that would round down to zero.
-    match Quantity::new_checked(native, EQUITY_SIZE_PRECISION) {
-        Ok(quantity) if !quantity.is_zero() => (Some(quantity), MIN_QUANTITY_SOURCE_NATIVE),
-        _ => (None, MIN_QUANTITY_SOURCE_UNREPRESENTABLE),
+    if !native_increment.is_finite() {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_INCREMENT_NON_FINITE);
     }
+
+    if native_increment < 0.0 {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_INCREMENT_NON_POSITIVE);
+    }
+
+    // --- 3. exact decimal restatement ------------------------------------ //
+    let (Some(min_dec), Some(increment_dec)) =
+        (exact_decimal(native_min), exact_decimal(native_increment))
+    else {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    };
+
+    // --- 4. common EXACT integer scale ----------------------------------- //
+    let scale = min_dec.scale().max(increment_dec.scale());
+    let (Some(min_units), Some(increment_units)) = (
+        mantissa_at_scale(min_dec, scale),
+        mantissa_at_scale(increment_dec, scale),
+    ) else {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    };
+    let Some(system_units) =
+        pow10_i128(scale).and_then(|unit| unit.checked_mul(EQUITY_SYSTEM_SIZE_INCREMENT_SHARES))
+    else {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    };
+
+    if min_units <= 0 || increment_units <= 0 || system_units <= 0 {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    }
+
+    // --- 5. the system increment must lie on the venue lattice ----------- //
+    if system_units % increment_units != 0 {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_INCREMENT_INCOMPATIBLE);
+    }
+
+    // --- 6. the native minimum must itself be on the venue lattice ------- //
+    if min_units % increment_units != 0 {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE);
+    }
+
+    // --- 7. the smallest whole-share count at or ABOVE the minimum ------- //
+    let Some(shares) = ceiling_div(min_units, system_units) else {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    };
+
+    if shares <= 0 {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    }
+
+    let Some(effective_units) = shares.checked_mul(system_units) else {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    };
+
+    // --- 8. re-prove the bound and the minimality of the result ---------- //
+    if effective_units < min_units || effective_units - system_units >= min_units {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    }
+
+    // The effective minimum, exactly, at the common scale.
+    let effective = Decimal::from_i128_with_scale(effective_units, scale);
+
+    // --- 9. representable by the model at the equity size precision ------ //
+    let Some(effective_f64) = share_count_to_f64(shares) else {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    };
+
+    let Ok(quantity) = Quantity::new_checked(effective_f64, EQUITY_SIZE_PRECISION) else {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    };
+
+    if quantity.is_zero() {
+        return EquityMinQuantity::refused(MIN_QUANTITY_SOURCE_UNREPRESENTABLE);
+    }
+
+    // The published minimum is the native value verbatim when the native value
+    // was already a whole number of shares; otherwise it is a normalized
+    // ceiling and says so.
+    let source = if effective_units == min_units {
+        MIN_QUANTITY_SOURCE_NATIVE
+    } else {
+        MIN_QUANTITY_SOURCE_NORMALIZED
+    };
+
+    EquityMinQuantity {
+        quantity: Some(quantity),
+        source,
+        raw_min_size: Some(min_dec),
+        raw_size_increment: Some(increment_dec),
+        effective: Some(effective),
+        system_increment: Decimal::from_i128_with_scale(EQUITY_SYSTEM_SIZE_INCREMENT_SHARES, 0),
+    }
+}
+
+/// The outcome of resolving an equity minimum order quantity from the native
+/// IB contract-details fields.
+///
+/// It carries both the resolved quantity and every input and output needed to
+/// audit the decision, so the provenance recorded on the instrument distinguishes
+/// the RAW venue minimum, the RAW venue increment, the EFFECTIVE system
+/// minimum, the SYSTEM increment, and the rule that produced them.
+#[derive(Debug)]
+struct EquityMinQuantity {
+    quantity: Option<Quantity>,
+    source: &'static str,
+    raw_min_size: Option<Decimal>,
+    raw_size_increment: Option<Decimal>,
+    effective: Option<Decimal>,
+    system_increment: Decimal,
+}
+
+impl EquityMinQuantity {
+    /// A refusal carries no quantity and no effective value, only the reason.
+    fn refused(source: &'static str) -> Self {
+        Self {
+            quantity: None,
+            source,
+            raw_min_size: None,
+            raw_size_increment: None,
+            effective: None,
+            system_increment: Decimal::from_i128_with_scale(EQUITY_SYSTEM_SIZE_INCREMENT_SHARES, 0),
+        }
+    }
+
+    /// The provenance entries this decision contributes to `info`.
+    fn provenance(&self) -> Vec<(&'static str, serde_json::Value)> {
+        // `normalize()` only strips trailing zeros (it never changes the
+        // value), so a minimum of one share reads as "1" rather than "1.0000"
+        // whatever scale the venue's increment happened to require.
+        let decimal_value = |value: Option<Decimal>| match value {
+            Some(decimal) => serde_json::Value::from(decimal.normalize().to_string()),
+            None => serde_json::Value::Null,
+        };
+
+        vec![
+            (INFO_KEY_RAW_MIN_SIZE, decimal_value(self.raw_min_size)),
+            (
+                INFO_KEY_RAW_SIZE_INCREMENT,
+                decimal_value(self.raw_size_increment),
+            ),
+            (
+                INFO_KEY_EFFECTIVE_MIN_QUANTITY,
+                decimal_value(self.effective),
+            ),
+            (
+                INFO_KEY_SYSTEM_SIZE_INCREMENT,
+                serde_json::Value::from(self.system_increment.to_string()),
+            ),
+            (
+                INFO_KEY_NORMALIZATION_RULE,
+                serde_json::Value::from(self.source),
+            ),
+        ]
+    }
+}
+
+/// Restate a native `f64` from the IB wire as an EXACT [`Decimal`].
+///
+/// Rust's `Display` for `f64` emits the shortest decimal string that round-trips
+/// back to the same `f64`, so parsing that string is a lossless restatement of
+/// the value the venue actually sent.  `Decimal::from_f64` applies its own
+/// rounding strategy and is deliberately not used; nothing here rounds.
+///
+/// Returns `None` when the value is not finite, or when its exact decimal form
+/// exceeds what [`Decimal`] can hold - both of which mean the value cannot take
+/// part in an exact proof and the caller must fail closed.
+fn exact_decimal(value: f64) -> Option<Decimal> {
+    if !value.is_finite() {
+        return None;
+    }
+
+    Decimal::from_str(&format!("{value}")).ok()
+}
+
+/// Re-express `value` at `scale`, returning its EXACT `i128` mantissa.
+///
+/// Refuses rather than rounds when `value` carries more precision than `scale`,
+/// and refuses on overflow.
+fn mantissa_at_scale(value: Decimal, scale: u32) -> Option<i128> {
+    let own_scale = value.scale();
+
+    if own_scale > scale {
+        return None;
+    }
+
+    value.mantissa().checked_mul(pow10_i128(scale - own_scale)?)
+}
+
+/// `10^exponent` as an exact `i128`, or `None` on overflow.
+fn pow10_i128(exponent: u32) -> Option<i128> {
+    let mut acc: i128 = 1;
+
+    for _ in 0..exponent {
+        acc = acc.checked_mul(10)?;
+    }
+
+    Some(acc)
+}
+
+/// Exact integer ceiling division for strictly positive operands.
+///
+/// `(a + b - 1) / b` computed with checked arithmetic, so it is stable on the
+/// toolchain this crate builds with and cannot silently overflow into a wrong
+/// (smaller) share count.
+fn ceiling_div(numerator: i128, denominator: i128) -> Option<i128> {
+    if numerator <= 0 || denominator <= 0 {
+        return None;
+    }
+
+    numerator
+        .checked_add(denominator)?
+        .checked_sub(1)?
+        .checked_div(denominator)
+}
+
+/// Convert an exact whole-share count into the `f64` the model accepts.
+///
+/// Beyond `2^53` an `f64` cannot represent every integer, so the count could not
+/// be reproduced exactly and the caller must refuse instead of publishing a
+/// value that silently differs from the one that was proved.
+fn share_count_to_f64(shares: i128) -> Option<f64> {
+    const MAX_EXACT_F64_INTEGER: i128 = 1i128 << 53;
+
+    if shares <= 0 || shares > MAX_EXACT_F64_INTEGER {
+        return None;
+    }
+
+    Some(shares as f64)
 }
 
 /// Convert tick size to precision value.
@@ -330,18 +625,23 @@ fn parse_equity_contract(
     let price_precision = tick_size_to_precision(details.min_tick);
     let timestamp = get_atomic_clock_realtime().get_time_ns();
 
-    // C2.10-E2-R2 / R1: the equity minimum executable quantity is propagated
-    // from the native IB contract-details response, and ONLY when that native
-    // value is usable as a whole-share minimum.  The builder never set
-    // `min_quantity` before this correction, so `Equity::min_quantity` stayed
+    // C2.10-E2-R2 / R1, corrected by C2.10-E2-R3-Q2: the equity minimum
+    // executable quantity is propagated from the native IB contract-details
+    // response, normalized from the venue's own `min_size` and `size_increment`
+    // onto the system's whole-share increment.  The builder never set
+    // `min_quantity` before the R1 correction, so `Equity::min_quantity` stayed
     // `None`, the instrument-legality gate downstream could not establish the
     // legality of any quantity, and EVERY equity request was refused before
-    // submission.  When the native metadata is absent or unusable the field is
+    // submission.  The R1 correction propagated the native value but refused
+    // every fractional one, which blocked live contracts such as SPY that
+    // report `min_size = 0.0001`.  The normalization now in force ceilings the
+    // native minimum onto the one-share lattice and records the full derivation.
+    // When the native metadata is absent, inconsistent or unusable the field is
     // deliberately left absent again, so that gate refuses instead of a value
-    // being invented, rounded or inferred from another field.
+    // being invented or rounded.
     // `price_precision`, `price_increment`, `lot_size` (the round lot) and the
     // instrument identity are unchanged.
-    let (min_quantity, min_quantity_source) = equity_min_quantity(details);
+    let min_quantity = equity_min_quantity(details);
 
     let mut info = ib_contract_info(details);
     info.insert(
@@ -358,8 +658,12 @@ fn parse_equity_contract(
     );
     info.insert(
         "minQuantitySource".to_string(),
-        serde_json::Value::from(min_quantity_source),
+        serde_json::Value::from(min_quantity.source),
     );
+
+    for (key, value) in min_quantity.provenance() {
+        info.insert(key.to_string(), value);
+    }
 
     let instrument = Equity::builder()
         .instrument_id(instrument_id)
@@ -367,11 +671,11 @@ fn parse_equity_contract(
         .currency(Currency::from(details.contract.currency.to_string()))
         .price_precision(price_precision)
         .price_increment(Price::new(details.min_tick, price_precision))
-        // `None` (absent or unusable native metadata) leaves `min_quantity`
-        // UNSET, which is the deliberate fail-closed outcome: the downstream
-        // instrument-legality gate then refuses any quantity for this
+        // `None` (absent, inconsistent or unusable native metadata) leaves
+        // `min_quantity` UNSET, which is the deliberate fail-closed outcome: the
+        // downstream instrument-legality gate then refuses any quantity for this
         // instrument instead of a minimum being manufactured for it.
-        .maybe_min_quantity(min_quantity)
+        .maybe_min_quantity(min_quantity.quantity)
         // Standard lot size for stocks
         .lot_size(Quantity::new(100.0, 0))
         .info(info)
@@ -601,9 +905,18 @@ mod tests {
 
     // C2.10-E2-R2-R1: the provenance labels the parser publishes, so the tests
     // assert the EXACT reason an unusable native minimum was not published.
+    use std::str::FromStr;
+
+    use rust_decimal::Decimal;
+
     use super::{
-        MIN_QUANTITY_SOURCE_FRACTIONAL, MIN_QUANTITY_SOURCE_MISSING, MIN_QUANTITY_SOURCE_NATIVE,
-        MIN_QUANTITY_SOURCE_NON_FINITE, MIN_QUANTITY_SOURCE_NON_POSITIVE,
+        INFO_KEY_EFFECTIVE_MIN_QUANTITY, INFO_KEY_NORMALIZATION_RULE, INFO_KEY_RAW_MIN_SIZE,
+        INFO_KEY_RAW_SIZE_INCREMENT, INFO_KEY_SYSTEM_SIZE_INCREMENT,
+        MIN_QUANTITY_SOURCE_INCREMENT_INCOMPATIBLE, MIN_QUANTITY_SOURCE_INCREMENT_MISSING,
+        MIN_QUANTITY_SOURCE_INCREMENT_NON_FINITE, MIN_QUANTITY_SOURCE_INCREMENT_NON_POSITIVE,
+        MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE, MIN_QUANTITY_SOURCE_MISSING,
+        MIN_QUANTITY_SOURCE_NATIVE, MIN_QUANTITY_SOURCE_NON_FINITE,
+        MIN_QUANTITY_SOURCE_NON_POSITIVE, MIN_QUANTITY_SOURCE_NORMALIZED,
         MIN_QUANTITY_SOURCE_UNREPRESENTABLE,
     };
     use ustr::Ustr;
@@ -904,19 +1217,27 @@ mod tests {
         }
     }
 
-    /// Requirements 8 and 9: a FRACTIONAL native minimum must never be rounded
-    /// into a whole share.  `Quantity::new(0.5, 0)` would silently yield 1 and
+    /// Requirements 8 and 9 (R1), RESTATED by C2.10-E2-R3-Q2: a native minimum
+    /// that cannot be safely normalized must never be rounded into a whole
+    /// share.  `Quantity::new(0.5, 0)` would silently yield 1 and
     /// `Quantity::new(1.5, 0)` would silently yield 2, because
-    /// `f64_to_fixed_u128` rounds to the requested precision.  This is the
-    /// defect the R1 correction removes.
+    /// `f64_to_fixed_u128` rounds to the requested precision.  The R3-Q2 rule
+    /// replaces that blanket refusal with a PROVEN ceiling, so each case here
+    /// must be refused for an identifiable reason rather than by rounding.
+    ///
+    /// The default fixture carries `size_increment = 1.0`, so a native minimum
+    /// with a fractional part is not a whole number of venue increments and the
+    /// venue's own two fields disagree.  Nothing is inferred from inconsistent
+    /// metadata, so these all still fail closed.
     #[rstest]
-    #[case(0.5)]
-    #[case(1.5)]
-    #[case(2.25)]
-    #[case(0.999)]
-    #[case(f64::MIN_POSITIVE)]
+    #[case(0.5, MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE)]
+    #[case(1.5, MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE)]
+    #[case(2.25, MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE)]
+    #[case(0.999, MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE)]
+    #[case(f64::MIN_POSITIVE, MIN_QUANTITY_SOURCE_UNREPRESENTABLE)]
     fn test_parse_equity_contract_fractional_native_min_size_is_never_rounded(
         #[case] min_size: f64,
+        #[case] expected_source: &str,
     ) {
         let (equity, _) = stock_equity("SPY", "ARCA", min_size);
         let info = equity.info.clone().expect("instrument info");
@@ -924,7 +1245,7 @@ mod tests {
         assert_eq!(
             equity.min_quantity(),
             None,
-            "fractional native min_size {min_size} must not be published for a \
+            "native min_size {min_size} must not be published for a \
              whole-share instrument"
         );
         // And specifically not the rounded whole share it would have become.
@@ -932,10 +1253,322 @@ mod tests {
         assert_ne!(equity.min_quantity(), Some(Quantity::new(2.0, 0)));
         assert_eq!(
             info.get("minQuantitySource"),
-            Some(&serde_json::Value::from(MIN_QUANTITY_SOURCE_FRACTIONAL)),
+            Some(&serde_json::Value::from(expected_source)),
         );
         // No fractional-share support is claimed anywhere.
         assert_eq!(equity.size_precision(), 0);
+        assert_eq!(
+            info.get(INFO_KEY_EFFECTIVE_MIN_QUANTITY),
+            Some(&serde_json::Value::Null),
+            "a refusal publishes no effective minimum"
+        );
+    }
+
+    // ------------------------------------------------------------------- //
+    // C2.10-E2-R3-Q2: whole-share normalization of native fractional       //
+    // equity constraints                                                   //
+    // ------------------------------------------------------------------- //
+
+    /// The required normalization table from the slice contract, executed
+    /// against the real parser.  Every case is a CEILING onto the one-share
+    /// increment, never a nearest-value rounding.
+    #[rstest]
+    #[case(0.0001, 0.0001, 1.0)]
+    #[case(0.5, 0.0001, 1.0)]
+    #[case(1.0, 0.0001, 1.0)]
+    #[case(1.5, 0.0001, 2.0)]
+    #[case(2.25, 0.0001, 3.0)]
+    #[case(5.0, 0.0001, 5.0)]
+    // The same table at other venue increments, all of which the system's
+    // one-share increment divides exactly.
+    #[case(0.0001, 0.000001, 1.0)]
+    #[case(0.5, 0.5, 1.0)]
+    #[case(1.5, 0.5, 2.0)]
+    #[case(2.25, 0.25, 3.0)]
+    #[case(1.0, 1.0, 1.0)]
+    fn test_parse_equity_contract_normalizes_native_minimum_by_ceiling(
+        #[case] min_size: f64,
+        #[case] size_increment: f64,
+        #[case] expected: f64,
+    ) {
+        let details = stock_details_with_increments("SPY", "ARCA", min_size, size_increment, 100.0);
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            equity.min_quantity(),
+            Some(Quantity::new(expected, 0)),
+            "min {min_size} / increment {size_increment} must normalize to \
+             {expected} whole shares"
+        );
+        assert_eq!(equity.min_quantity().unwrap().precision, 0);
+        assert_eq!(equity.size_precision(), 0);
+        assert_eq!(
+            info.get(INFO_KEY_EFFECTIVE_MIN_QUANTITY),
+            Some(&serde_json::Value::from(format!("{expected}"))),
+        );
+        assert_eq!(
+            info.get(INFO_KEY_SYSTEM_SIZE_INCREMENT),
+            Some(&serde_json::Value::from("1")),
+        );
+        // Raw venue metadata survives verbatim alongside the derivation.
+        assert_eq!(
+            info.get("minSize"),
+            Some(&serde_json::Value::from(min_size)),
+        );
+        assert_eq!(
+            info.get("sizeIncrement"),
+            Some(&serde_json::Value::from(size_increment)),
+        );
+        assert_eq!(
+            info.get("suggestedSizeIncrement"),
+            Some(&serde_json::Value::from(100.0)),
+        );
+    }
+
+    /// `minQuantitySource` must distinguish a minimum published VERBATIM from
+    /// the native field from one produced by the ceiling.
+    #[rstest]
+    #[case(1.0, 1.0, MIN_QUANTITY_SOURCE_NATIVE)]
+    #[case(5.0, 1.0, MIN_QUANTITY_SOURCE_NATIVE)]
+    #[case(1.0, 0.0001, MIN_QUANTITY_SOURCE_NATIVE)]
+    #[case(0.0001, 0.0001, MIN_QUANTITY_SOURCE_NORMALIZED)]
+    #[case(0.5, 0.0001, MIN_QUANTITY_SOURCE_NORMALIZED)]
+    #[case(1.5, 0.0001, MIN_QUANTITY_SOURCE_NORMALIZED)]
+    #[case(2.25, 0.0001, MIN_QUANTITY_SOURCE_NORMALIZED)]
+    fn test_parse_equity_contract_records_which_rule_published_the_minimum(
+        #[case] min_size: f64,
+        #[case] size_increment: f64,
+        #[case] expected_source: &str,
+    ) {
+        let details = stock_details_with_increments("SPY", "ARCA", min_size, size_increment, 100.0);
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(expected_source)),
+        );
+        assert_eq!(
+            info.get(INFO_KEY_NORMALIZATION_RULE),
+            Some(&serde_json::Value::from(expected_source)),
+        );
+        // The raw inputs are ALWAYS recorded, whatever the outcome.
+        assert!(info.get(INFO_KEY_RAW_MIN_SIZE).is_some());
+        assert!(info.get(INFO_KEY_RAW_SIZE_INCREMENT).is_some());
+    }
+
+    /// The normalization is a NARROWING: the published minimum is never below
+    /// the native one, and is always the SMALLEST whole share at or above it.
+    #[rstest]
+    #[case(0.0001, 0.0001)]
+    #[case(0.5, 0.0001)]
+    #[case(1.0, 0.0001)]
+    #[case(1.5, 0.0001)]
+    #[case(2.25, 0.0001)]
+    #[case(5.0, 0.0001)]
+    #[case(2.25, 0.25)]
+    fn test_parse_equity_contract_normalized_minimum_is_a_safe_ceiling(
+        #[case] min_size: f64,
+        #[case] size_increment: f64,
+    ) {
+        let details = stock_details_with_increments("SPY", "ARCA", min_size, size_increment, 100.0);
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+
+        let published = equity.min_quantity().expect("minimum published");
+        let published_decimal = Decimal::from_str(&published.to_string()).unwrap();
+        let native_decimal = Decimal::from_str(&format!("{min_size}")).unwrap();
+
+        assert!(
+            published_decimal >= native_decimal,
+            "the published minimum {published_decimal} must never be BELOW the \
+             native minimum {native_decimal}"
+        );
+        assert!(
+            published_decimal - Decimal::ONE < native_decimal,
+            "the published minimum {published_decimal} must be the SMALLEST \
+             whole share at or above the native minimum {native_decimal}"
+        );
+    }
+
+    /// A native increment the system's one-share step cannot express as a whole
+    /// number of increments proves no alignment, so nothing is published.
+    #[rstest]
+    #[case(1.0, 5.0)]
+    #[case(5.0, 25.0)]
+    #[case(1.0, 3.0)]
+    #[case(2.0, 7.0)]
+    #[case(1.0, 0.3)]
+    // A 40-share lattice: one share is not a whole number of 40-share steps.
+    #[case(40.0, 40.0)]
+    fn test_parse_equity_contract_incompatible_venue_increment_fails_closed(
+        #[case] min_size: f64,
+        #[case] size_increment: f64,
+    ) {
+        let details = stock_details_with_increments("SPY", "ARCA", min_size, size_increment, 100.0);
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            equity.min_quantity(),
+            None,
+            "the system one-share increment does not lie on the {size_increment} \
+             lattice, so alignment cannot be proven"
+        );
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(
+                MIN_QUANTITY_SOURCE_INCREMENT_INCOMPATIBLE
+            )),
+        );
+    }
+
+    /// A usable `min_size` cannot rescue an unusable increment: normalization
+    /// needs the lattice, so a missing, non-finite or non-positive
+    /// `size_increment` fails closed with its own provenance.
+    #[rstest]
+    #[case(0.0, MIN_QUANTITY_SOURCE_INCREMENT_MISSING)]
+    #[case(-1.0, MIN_QUANTITY_SOURCE_INCREMENT_NON_POSITIVE)]
+    #[case(f64::NAN, MIN_QUANTITY_SOURCE_INCREMENT_NON_FINITE)]
+    #[case(f64::INFINITY, MIN_QUANTITY_SOURCE_INCREMENT_NON_FINITE)]
+    #[case(f64::NEG_INFINITY, MIN_QUANTITY_SOURCE_INCREMENT_NON_FINITE)]
+    fn test_parse_equity_contract_unusable_venue_increment_fails_closed(
+        #[case] size_increment: f64,
+        #[case] expected_source: &str,
+    ) {
+        let details = stock_details_with_increments("SPY", "ARCA", 1.0, size_increment, 100.0);
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(equity.min_quantity(), None);
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(expected_source)),
+        );
+    }
+
+    /// `suggested_size_increment` is advisory only.  It must never become the
+    /// minimum, never cap or raise the published minimum, and never be treated
+    /// as a mandatory increment - including when it is the ONLY larger number
+    /// in the response.
+    #[rstest]
+    #[case(0.0001, 0.0001, 40.0)]
+    #[case(0.0001, 0.0001, 1.0e9)]
+    #[case(1.0, 0.0001, 40.0)]
+    #[case(1.5, 0.0001, 500.0)]
+    fn test_parse_equity_contract_suggested_increment_never_becomes_the_minimum(
+        #[case] min_size: f64,
+        #[case] size_increment: f64,
+        #[case] suggested: f64,
+    ) {
+        let details =
+            stock_details_with_increments("SPY", "ARCA", min_size, size_increment, suggested);
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+        let info = equity.info.clone().expect("instrument info");
+
+        let published = equity.min_quantity().expect("minimum published");
+        assert_ne!(published, Quantity::new(suggested, 0));
+        assert!(
+            Decimal::from_str(&published.to_string()).unwrap()
+                < Decimal::from_str(&format!("{suggested}")).unwrap(),
+            "the published minimum must not be inflated to the suggested size \
+             increment"
+        );
+        assert_eq!(
+            info.get("suggestedSizeIncrement"),
+            Some(&serde_json::Value::from(suggested)),
+        );
+    }
+
+    /// The exact live SPY fixture collected in C2.10-E2-Q1-R1: the real TWS
+    /// PAPER contract details that blocked every order.  This is the case the
+    /// correction exists for.
+    #[rstest]
+    fn test_parse_equity_contract_live_spy_fractional_fixture_normalizes_to_one_share() {
+        let mut details = stock_details_with_increments("SPY", "ARCA", 0.0001, 0.0001, 40.0);
+        details.min_tick = 0.01;
+        details.contract.local_symbol = "SPY".to_string();
+
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
+        let InstrumentAny::Equity(equity) =
+            parse_ib_contract_to_instrument(&details, instrument_id).unwrap()
+        else {
+            panic!("expected equity");
+        };
+        let info = equity.info.clone().expect("instrument info");
+
+        assert_eq!(
+            equity.min_quantity(),
+            Some(Quantity::new(1.0, 0)),
+            "live SPY minSize 0.0001 / sizeIncrement 0.0001 must normalize to \
+             exactly one whole share"
+        );
+        assert_eq!(equity.id, instrument_id);
+        assert_eq!(equity.size_precision(), 0);
+        assert_eq!(equity.lot_size(), Some(Quantity::new(100.0, 0)));
+        assert_eq!(equity.price_precision(), 2);
+        assert_eq!(equity.price_increment(), Price::new(0.01, 2));
+
+        // Full provenance: raw in, effective out, rule that produced it.
+        assert_eq!(info.get("minSize"), Some(&serde_json::Value::from(0.0001)));
+        assert_eq!(
+            info.get("sizeIncrement"),
+            Some(&serde_json::Value::from(0.0001)),
+        );
+        assert_eq!(
+            info.get("suggestedSizeIncrement"),
+            Some(&serde_json::Value::from(40.0)),
+        );
+        assert_eq!(
+            info.get(INFO_KEY_RAW_MIN_SIZE),
+            Some(&serde_json::Value::from("0.0001")),
+        );
+        assert_eq!(
+            info.get(INFO_KEY_RAW_SIZE_INCREMENT),
+            Some(&serde_json::Value::from("0.0001")),
+        );
+        assert_eq!(
+            info.get(INFO_KEY_EFFECTIVE_MIN_QUANTITY),
+            Some(&serde_json::Value::from("1")),
+        );
+        assert_eq!(
+            info.get(INFO_KEY_SYSTEM_SIZE_INCREMENT),
+            Some(&serde_json::Value::from("1")),
+        );
+        assert_eq!(
+            info.get("minQuantitySource"),
+            Some(&serde_json::Value::from(MIN_QUANTITY_SOURCE_NORMALIZED)),
+        );
     }
 
     /// A positive whole value that the model cannot represent must fail closed
@@ -981,13 +1614,21 @@ mod tests {
 
     /// Requirement 11: neither `size_increment` nor
     /// `suggested_size_increment` may be substituted for the minimum.
+    ///
+    /// RESTATED by C2.10-E2-R3-Q2: `size_increment` is now a REQUIRED input to
+    /// the normalization (it supplies the lattice), but it is still never the
+    /// published minimum.  The cases below use increments the system's
+    /// one-share step divides exactly, so a minimum IS published - and it is the
+    /// ceiling, not either increment.
     #[rstest]
-    #[case(1.0, 5.0, 250.0)]
-    #[case(5.0, 25.0, 500.0)]
+    #[case(1.0, 0.25, 250.0, 1.0)]
+    #[case(5.0, 0.25, 500.0, 5.0)]
+    #[case(1.5, 0.5, 500.0, 2.0)]
     fn test_parse_equity_contract_size_increments_are_not_substituted(
         #[case] min_size: f64,
         #[case] size_increment: f64,
         #[case] suggested_size_increment: f64,
+        #[case] expected: f64,
     ) {
         let details = stock_details_with_increments(
             "SPY",
@@ -1004,8 +1645,9 @@ mod tests {
         };
         let info = equity.info.clone().expect("instrument info");
 
-        // The published minimum is the native `min_size`, not either increment.
-        assert_eq!(equity.min_quantity(), Some(Quantity::new(min_size, 0)));
+        // The published minimum is the ceiling of the native `min_size`, not
+        // either increment.
+        assert_eq!(equity.min_quantity(), Some(Quantity::new(expected, 0)));
         assert_ne!(
             equity.min_quantity(),
             Some(Quantity::new(size_increment, 0))
@@ -1027,9 +1669,19 @@ mod tests {
 
     /// Requirement 11 (negative direction): with an UNUSABLE native minimum,
     /// usable increments must not rescue it into a minimum.
+    ///
+    /// The pre-R3-Q2 form of this test used `size_increment = 1.0` with a zero
+    /// minimum, so the minimum was rejected before the increment was ever
+    /// consulted.  The increment is now itself a required input, so the
+    /// increment is held at its default and only the minimum varies - which is
+    /// what "the increments did not rescue it" actually means.
     #[rstest]
-    fn test_parse_equity_contract_increments_do_not_rescue_unusable_minimum() {
-        let details = stock_details_with_increments("SPY", "ARCA", 0.0, 1.0, 100.0);
+    #[case(0.0)]
+    #[case(-1.0)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    fn test_parse_equity_contract_increments_do_not_rescue_unusable_minimum(#[case] min_size: f64) {
+        let details = stock_details_with_increments("SPY", "ARCA", min_size, 1.0, 100.0);
         let instrument_id = InstrumentId::new(NautilusSymbol::from("SPY"), Venue::from("ARCA"));
         let InstrumentAny::Equity(equity) =
             parse_ib_contract_to_instrument(&details, instrument_id).unwrap()

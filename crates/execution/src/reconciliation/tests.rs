@@ -1472,6 +1472,13 @@ fn make_test_report(
 #[rstest]
 #[case::accepted(OrderStatus::Accepted, "0", 1, "Accepted")]
 #[case::triggered(OrderStatus::Triggered, "0", 1, "Accepted")]
+// C2.10-E2-R4 (D-3): a venue reporting `Submitted` for an order it already
+// holds reports a live working order. Before this correction the case
+// produced ZERO events (the `_ =>` arm), so the order object never received
+// the `Accepted` event carrying `report.venue_order_id`, leaving
+// `venue_order_id() == None` and making target-bound cancellation unroutable
+// after reconstruction.
+#[case::submitted(OrderStatus::Submitted, "0", 1, "Accepted")]
 #[case::canceled(OrderStatus::Canceled, "0", 2, "Canceled")]
 #[case::partially_canceled(OrderStatus::Canceled, "0.5", 3, "Canceled")]
 #[case::fully_matched_canceled(OrderStatus::Canceled, "1.0", 2, "Filled")]
@@ -1515,6 +1522,67 @@ fn test_external_order_status_event_generation(
         _ => "Other",
     };
     assert_eq!(actual_type, last_event_type, "status={status}");
+}
+
+/// C2.10-E2-R4 (D-3).
+///
+/// The authoritative venue order ID must survive external reconstruction,
+/// because that ID -- not the cache's separate client->venue mapping -- is what
+/// `Strategy::cancel_order` reads when it builds `CancelOrder`. A reconciled
+/// `SUBMITTED` order that ends up with `venue_order_id() == None` cannot be
+/// cancelled by target identity from a reconstructing process, which is the
+/// accepted R3-Q2 defect.
+#[rstest]
+fn test_external_submitted_order_carries_venue_identity_for_targeted_cancel() {
+    let instrument = crypto_perpetual_ethusdt();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.0"))
+        .price(Price::from("100.00"))
+        .build();
+
+    assert_eq!(
+        order.venue_order_id(),
+        None,
+        "precondition: a freshly initialized order carries no venue identity"
+    );
+
+    let report = make_test_report(
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Submitted,
+        "0",
+        false,
+    );
+    let expected_venue_order_id = report.venue_order_id;
+
+    let events = generate_external_order_status_events(
+        &order,
+        &report,
+        &AccountId::from("TEST-001"),
+        &InstrumentAny::CryptoPerpetual(instrument),
+        UnixNanos::from(2_000_000),
+    );
+
+    assert_eq!(
+        events.len(),
+        1,
+        "a working venue order must produce exactly one acceptance event"
+    );
+
+    let OrderEventAny::Accepted(accepted) = &events[0] else {
+        panic!("expected acceptance, got {:?}", events[0]);
+    };
+    assert_eq!(accepted.venue_order_id, expected_venue_order_id);
+
+    let after = apply_events(&order, &events);
+    assert_eq!(after.status(), OrderStatus::Accepted);
+    assert_eq!(
+        after.venue_order_id(),
+        Some(expected_venue_order_id),
+        "the order object must carry the venue identity that cancellation reads"
+    );
 }
 
 #[rstest]
