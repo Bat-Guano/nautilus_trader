@@ -1615,7 +1615,6 @@ mod completed_order_report_tests {
         orders::{Action, Order, OrderData, OrderState, OrderStatusKind},
     };
     use nautilus_model::identifiers::{Symbol, Venue};
-
     use rstest::rstest;
 
     use super::*;

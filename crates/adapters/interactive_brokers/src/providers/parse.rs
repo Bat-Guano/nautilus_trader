@@ -892,6 +892,10 @@ fn parse_option_contract(
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
+    // C2.10-E2-R2-R1: the provenance labels the parser publishes, so the tests
+    // assert the EXACT reason an unusable native minimum was not published.
+    use std::str::FromStr;
+
     use ibapi::contracts::{
         Contract, ContractDetails, Currency, Exchange, OptionRight, SecurityType, Symbol,
     };
@@ -902,12 +906,8 @@ mod tests {
         types::{Price, Quantity},
     };
     use rstest::rstest;
-
-    // C2.10-E2-R2-R1: the provenance labels the parser publishes, so the tests
-    // assert the EXACT reason an unusable native minimum was not published.
-    use std::str::FromStr;
-
     use rust_decimal::Decimal;
+    use ustr::Ustr;
 
     use super::{
         INFO_KEY_EFFECTIVE_MIN_QUANTITY, INFO_KEY_NORMALIZATION_RULE, INFO_KEY_RAW_MIN_SIZE,
@@ -917,13 +917,8 @@ mod tests {
         MIN_QUANTITY_SOURCE_MIN_OFF_LATTICE, MIN_QUANTITY_SOURCE_MISSING,
         MIN_QUANTITY_SOURCE_NATIVE, MIN_QUANTITY_SOURCE_NON_FINITE,
         MIN_QUANTITY_SOURCE_NON_POSITIVE, MIN_QUANTITY_SOURCE_NORMALIZED,
-        MIN_QUANTITY_SOURCE_UNREPRESENTABLE,
-    };
-    use ustr::Ustr;
-
-    use super::{
-        parse_contract_multiplier, parse_ib_contract_to_instrument,
-        parse_option_spread_instrument_id,
+        MIN_QUANTITY_SOURCE_UNREPRESENTABLE, parse_contract_multiplier,
+        parse_ib_contract_to_instrument, parse_option_spread_instrument_id,
     };
 
     #[rstest]

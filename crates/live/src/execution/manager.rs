@@ -5664,8 +5664,10 @@ fn terminal_report_has_missing_fills(report: &OrderStatusReport, filled_qty: Qua
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::clock::TestClock;
-    use nautilus_common::msgbus::{ShareableMessageHandler, stubs::get_any_saving_handler};
+    use nautilus_common::{
+        clock::TestClock,
+        msgbus::{ShareableMessageHandler, stubs::get_any_saving_handler},
+    };
     use nautilus_core::{DurationNanos, Params};
     use nautilus_execution::reconciliation::generate_reconciliation_order_events;
     use nautilus_model::{

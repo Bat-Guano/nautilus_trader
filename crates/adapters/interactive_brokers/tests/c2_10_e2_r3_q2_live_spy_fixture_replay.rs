@@ -33,9 +33,7 @@
 
 use std::path::PathBuf;
 
-use ibapi::contracts::{
-    Contract, ContractDetails, Currency, Exchange, SecurityType, Symbol,
-};
+use ibapi::contracts::{Contract, ContractDetails, Currency, Exchange, SecurityType, Symbol};
 use nautilus_core::Params;
 use nautilus_interactive_brokers::providers::parse::parse_ib_contract_to_instrument;
 use nautilus_model::{
