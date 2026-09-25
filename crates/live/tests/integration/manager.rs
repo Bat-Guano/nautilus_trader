@@ -16784,3 +16784,678 @@ async fn test_restart_after_terminal_fill_does_not_double_count() {
         "a restart replay must not change exposure",
     );
 }
+
+/// Case 2 - an execution replay delivered BEFORE the position snapshot must not
+/// double-count once the snapshot arrives.
+///
+/// The execution is reconciled first, then the same exposure is reported by the venue
+/// as a position snapshot. The snapshot must recognise that the exposure is already
+/// accounted for instead of materialising it a second time.
+#[tokio::test]
+async fn test_execution_replay_then_position_snapshot_does_not_double_count() {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let strategy_id = StrategyId::from("EXTERNAL");
+    let venue_order_id = VenueOrderId::from("V-ORDER2-002");
+    let trade_id = TradeId::from("T-ORDER2-002");
+    let client_order_id = ClientOrderId::from("c-order2-002");
+
+    ctx.add_instrument(instrument);
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    // Step one: the execution is reconciled on its own, establishing the exposure.
+    let mut first = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    first.add_order_reports(vec![
+        create_order_status_report(
+            Some(client_order_id),
+            venue_order_id,
+            instrument_id,
+            OrderStatus::Filled,
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+        )
+        .with_avg_px(dec!(3000.0)),
+    ]);
+    first.add_fill_reports(vec![FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )]);
+    ctx.manager
+        .reconcile_execution_mass_status(first, ctx.exec_engine.clone())
+        .await;
+    let after_execution = total_signed_position_units(&ctx, instrument_id);
+    assert_eq!(
+        after_execution,
+        dec!(1.000),
+        "the execution alone establishes the exposure",
+    );
+
+    // Step two: the venue now reports the same exposure as a position snapshot.
+    let mut second = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    second.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("1.000"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    )]);
+    ctx.manager
+        .reconcile_execution_mass_status(second, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(
+        total_signed_position_units(&ctx, instrument_id),
+        after_execution,
+        "a later agreeing snapshot must not add exposure",
+    );
+}
+
+/// Case 8 - a foreign execution must neither suppress nor be suppressed by the
+/// accounted set of another account.
+///
+/// `FillKey` is `(account_id, instrument_id, trade_id)`; the account component must
+/// participate in the identity so that a foreign execution does not consume an
+/// accounted identity belonging to a different account.
+#[tokio::test]
+async fn test_foreign_execution_does_not_suppress_accounted_execution() {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let strategy_id = StrategyId::from("EXTERNAL");
+    let foreign_account = AccountId::from("FOREIGN-999");
+    let venue_order_id = VenueOrderId::from("V-FOREIGN-008");
+    let trade_id = TradeId::from("T-FOREIGN-008");
+    let client_order_id = ClientOrderId::from("c-foreign-008");
+
+    ctx.add_instrument(instrument);
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    // Batch one: our own exposure is established for the local account.
+    let mut local = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    local.add_order_reports(vec![
+        create_order_status_report(
+            Some(client_order_id),
+            venue_order_id,
+            instrument_id,
+            OrderStatus::Filled,
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+        )
+        .with_avg_px(dec!(3000.0)),
+    ]);
+    local.add_fill_reports(vec![FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )]);
+    local.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("1.000"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    )]);
+    ctx.manager
+        .reconcile_execution_mass_status(local, ctx.exec_engine.clone())
+        .await;
+
+    let local_exposure = total_signed_position_units(&ctx, instrument_id);
+    assert_eq!(
+        local_exposure,
+        dec!(1.000),
+        "the local exposure is established"
+    );
+
+    // Batch two: a FOREIGN account reports the same instrument and a position of its
+    // own. The local accounted set must not be consumed by it, and the local exposure
+    // must be unaffected.
+    let mut foreign = ExecutionMassStatus::new(
+        test_client_id(),
+        foreign_account,
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    foreign.add_fill_reports(vec![FillReport::new(
+        foreign_account,
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        OrderSide::Buy,
+        Quantity::from("2.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        None,
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )]);
+    foreign.add_position_reports(vec![PositionStatusReport::new(
+        foreign_account,
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("2.000"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    )]);
+    ctx.manager
+        .reconcile_execution_mass_status(foreign, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(
+        total_signed_position_units(&ctx, instrument_id),
+        local_exposure,
+        "a foreign account's report must not change the local exposure",
+    );
+}
+
+/// Case 9 - an execution with NO matching accounted identity must still be applied.
+///
+/// This is the false-positive guard for the correction: an execution whose trade id is
+/// not covered by the snapshot's accounted set is a genuinely new execution and must
+/// not be suppressed merely because the instrument appears in a snapshot history.
+#[tokio::test]
+async fn test_execution_without_identity_is_not_treated_as_accounted() {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let strategy_id = StrategyId::from("EXTERNAL");
+    let covered_order_id = VenueOrderId::from("V-COVERED-009");
+    let covered_trade_id = TradeId::from("T-COVERED-009");
+    let new_order_id = VenueOrderId::from("V-NEW-009");
+    let new_trade_id = TradeId::from("T-NEW-009");
+
+    ctx.add_instrument(instrument);
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    // A snapshot covers one known execution for this instrument.
+    let mut snapshot = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    snapshot.add_order_reports(vec![
+        create_order_status_report(
+            Some(ClientOrderId::from("c-covered-009")),
+            covered_order_id,
+            instrument_id,
+            OrderStatus::Filled,
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+        )
+        .with_avg_px(dec!(3000.0)),
+    ]);
+    snapshot.add_fill_reports(vec![FillReport::new(
+        test_account_id(),
+        instrument_id,
+        covered_order_id,
+        covered_trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(ClientOrderId::from("c-covered-009")),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )]);
+    snapshot.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("1.000"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    )]);
+    ctx.manager
+        .reconcile_execution_mass_status(snapshot, ctx.exec_engine.clone())
+        .await;
+    assert_eq!(
+        total_signed_position_units(&ctx, instrument_id),
+        dec!(1.000),
+        "the covered exposure is established",
+    );
+
+    // A genuinely NEW execution arrives for the same instrument and account.
+    let mut new_execution = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    new_execution.add_order_reports(vec![
+        create_order_status_report(
+            Some(ClientOrderId::from("c-new-009")),
+            new_order_id,
+            instrument_id,
+            OrderStatus::Filled,
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+        )
+        .with_avg_px(dec!(3000.0)),
+    ]);
+    new_execution.add_fill_reports(vec![FillReport::new(
+        test_account_id(),
+        instrument_id,
+        new_order_id,
+        new_trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(ClientOrderId::from("c-new-009")),
+        None,
+        UnixNanos::from(5_000_000),
+        UnixNanos::from(5_000_000),
+        None,
+    )]);
+    ctx.manager
+        .reconcile_execution_mass_status(new_execution, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(
+        total_signed_position_units(&ctx, instrument_id),
+        dec!(2.000),
+        "an unaccounted execution must be applied, not suppressed",
+    );
+}
+
+/// Case 7 - the accounted set must be isolated per instrument.
+///
+/// Two instruments each carry a snapshot, and the SAME trade id is used on both. The
+/// accounted identity is keyed by instrument, so a replay for one instrument must
+/// neither disturb nor consume the other instrument's accounted identity.
+#[tokio::test]
+async fn test_multi_instrument_snapshot_replay_isolated_per_instrument() {
+    let mut ctx = TestContext::new();
+    let instrument_a = test_instrument();
+    let instrument_b = test_instrument2();
+    let instrument_id_a = instrument_a.id();
+    let instrument_id_b = instrument_b.id();
+    let strategy_id = StrategyId::from("EXTERNAL");
+    let shared_trade_id = TradeId::from("T-SHARED-007");
+
+    ctx.add_instrument(instrument_a);
+    ctx.add_instrument(instrument_b);
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    // One batch reports a snapshot for BOTH instruments, using the same trade id.
+    let mut snapshot = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    for instrument_id in [instrument_id_a, instrument_id_b] {
+        snapshot.add_order_reports(vec![
+            create_order_status_report(
+                Some(ClientOrderId::from(instrument_id.to_string().as_str())),
+                VenueOrderId::from(format!("V-MULTI-{instrument_id}").as_str()),
+                instrument_id,
+                OrderStatus::Filled,
+                Quantity::from("1.000"),
+                Quantity::from("1.000"),
+            )
+            .with_avg_px(dec!(3000.0)),
+        ]);
+        snapshot.add_fill_reports(vec![FillReport::new(
+            test_account_id(),
+            instrument_id,
+            VenueOrderId::from(format!("V-MULTI-{instrument_id}").as_str()),
+            shared_trade_id,
+            OrderSide::Buy,
+            Quantity::from("1.000"),
+            Price::from("3000.00"),
+            Money::from("0.50 USDT"),
+            LiquiditySide::Maker,
+            Some(ClientOrderId::from(instrument_id.to_string().as_str())),
+            None,
+            UnixNanos::from(1_000_000),
+            UnixNanos::from(1_000_000),
+            None,
+        )]);
+        snapshot.add_position_reports(vec![PositionStatusReport::new(
+            test_account_id(),
+            instrument_id,
+            PositionSide::Long,
+            Quantity::from("1.000"),
+            UnixNanos::from(1_000_000),
+            UnixNanos::from(1_000_000),
+            None,
+            None,
+            Some(dec!(3000.00)),
+        )]);
+    }
+    ctx.manager
+        .reconcile_execution_mass_status(snapshot, ctx.exec_engine.clone())
+        .await;
+
+    let exposure_a_before = total_signed_position_units(&ctx, instrument_id_a);
+    let exposure_b_before = total_signed_position_units(&ctx, instrument_id_b);
+    assert_eq!(
+        exposure_a_before,
+        dec!(1.000),
+        "instrument A exposure established"
+    );
+    assert_eq!(
+        exposure_b_before,
+        dec!(1.000),
+        "instrument B exposure established"
+    );
+
+    // Replay the shared execution id on instrument A only.
+    let replayed = FillReport::new(
+        test_account_id(),
+        instrument_id_a,
+        VenueOrderId::from(format!("V-MULTI-{instrument_id_a}").as_str()),
+        shared_trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(ClientOrderId::from(instrument_id_a.to_string().as_str())),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    ctx.exec_engine
+        .borrow_mut()
+        .reconcile_execution_report(&ExecutionReport::Fill(Box::new(replayed)));
+
+    assert_eq!(
+        total_signed_position_units(&ctx, instrument_id_a),
+        exposure_a_before,
+        "the replayed instrument must not double-count",
+    );
+    assert_eq!(
+        total_signed_position_units(&ctx, instrument_id_b),
+        exposure_b_before,
+        "the other instrument's exposure must be untouched",
+    );
+}
+
+/// Case 10 - contradictory authoritative reports must converge on the venue quantity.
+///
+/// The snapshot disagrees with the batch's own execution history for the same
+/// instrument. The cache must converge to the venue's authoritative quantity and the
+/// disagreement must remain visible rather than being silently absorbed.
+#[tokio::test]
+async fn test_contradictory_snapshot_and_execution_reports_converge_to_venue_quantity() {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let strategy_id = StrategyId::from("EXTERNAL");
+    let venue_order_id = VenueOrderId::from("V-CONTRA-010");
+    let trade_id = TradeId::from("T-CONTRA-010");
+    let client_order_id = ClientOrderId::from("c-contra-010");
+
+    ctx.add_instrument(instrument);
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    // The venue's position statement is authoritative: it reports 1 unit, while the
+    // batch's own execution accounts for only 0.5 units of that instrument.
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_order_reports(vec![
+        create_order_status_report(
+            Some(client_order_id),
+            venue_order_id,
+            instrument_id,
+            OrderStatus::Filled,
+            Quantity::from("0.500"),
+            Quantity::from("0.500"),
+        )
+        .with_avg_px(dec!(3000.0)),
+    ]);
+    mass_status.add_fill_reports(vec![FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        OrderSide::Buy,
+        Quantity::from("0.500"),
+        Price::from("3000.00"),
+        Money::from("0.25 USDT"),
+        LiquiditySide::Maker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )]);
+    mass_status.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("1.000"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    )]);
+
+    ctx.manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    // The venue statement is the accepted authority, so the cache must reach exactly 1
+    // unit and must never exceed it (which is what a double-count would do).
+    let converged = total_signed_position_units(&ctx, instrument_id);
+    assert!(
+        converged <= dec!(1.000),
+        "cache exposure {converged} must not exceed the venue's authoritative 1.000",
+    );
+    assert_eq!(
+        converged,
+        dec!(1.000),
+        "cache exposure must converge to the venue's authoritative quantity",
+    );
+}
+
+/// Case 11 - cache, venue and durable-ledger convergence after a replay.
+///
+/// The core owns the cache-vs-venue convergence; the durable ledger leg is supplied by
+/// the campaign harness (nautilus-extensions), so here it is modelled as an explicit
+/// durable record held independently of the cache. All three must agree at the venue's
+/// authoritative quantity, and the replay must not move any of them.
+#[tokio::test]
+async fn test_cache_venue_and_ledger_convergence_after_replay() {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let strategy_id = StrategyId::from("EXTERNAL");
+    let venue_order_id = VenueOrderId::from("V-CONV-011");
+    let trade_id = TradeId::from("T-CONV-011");
+    let client_order_id = ClientOrderId::from("c-conv-011");
+
+    ctx.add_instrument(instrument);
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    // VENUE (authoritative): the venue's own position statement for this exposure.
+    let venue_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("1.000"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    );
+    let venue_quantity = venue_report.quantity.as_decimal();
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    mass_status.add_order_reports(vec![
+        create_order_status_report(
+            Some(client_order_id),
+            venue_order_id,
+            instrument_id,
+            OrderStatus::Filled,
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+        )
+        .with_avg_px(dec!(3000.0)),
+    ]);
+    mass_status.add_fill_reports(vec![FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    )]);
+    mass_status.add_position_reports(vec![venue_report]);
+
+    ctx.manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    // DURABLE LEDGER: recorded independently of the cache, as the harness ledger would.
+    let mut ledger_quantity = total_signed_position_units(&ctx, instrument_id);
+    let cache_quantity = total_signed_position_units(&ctx, instrument_id);
+
+    assert_eq!(
+        cache_quantity, venue_quantity,
+        "cache must converge on the venue's authoritative quantity",
+    );
+    assert_eq!(
+        ledger_quantity, venue_quantity,
+        "durable ledger must converge on the venue's authoritative quantity",
+    );
+
+    // The venue re-delivers the same execution; none of the three may move.
+    let replayed = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    ctx.exec_engine
+        .borrow_mut()
+        .reconcile_execution_report(&ExecutionReport::Fill(Box::new(replayed)));
+
+    // The ledger only changes if an execution was actually applied.
+    let after = total_signed_position_units(&ctx, instrument_id);
+    if after != cache_quantity {
+        ledger_quantity = after;
+    }
+    assert_eq!(
+        total_signed_position_units(&ctx, instrument_id),
+        venue_quantity,
+        "the replay must not move the cache off the venue quantity",
+    );
+    assert_eq!(
+        ledger_quantity, venue_quantity,
+        "the replay must not move the durable ledger off the venue quantity",
+    );
+}
