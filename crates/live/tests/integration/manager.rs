@@ -8847,20 +8847,44 @@ fn cached_order_state(ctx: &TestContext, venue_order_id: VenueOrderId) -> (Order
 
 /// Case 5 - reconnect with filled order history (TEST_PLAN_C.md).
 ///
-/// This is the reconstruction of the `on1-exit-3` incident. The engine drops the/// projected fill for the freshly created external order (`InvalidStateTrigger`), so
-/// the order ends terminal with the venue execution id UNREGISTERED; the core then
-/// finds the engine flat where the venue reports exposure and materialises a position
-/// from the venue snapshot; finally the venue re-delivers the same execution and it is
-/// applied on top, yielding cache 2 for venue 1.
+/// This case is the reconstruction attempt for the `on1-exit-3` incident, and it is the
+/// documented residual gap: it does NOT satisfy the requirement of failing on the
+/// unmodified tree for the stated reason, and it is `#[ignore]`d rather than presented
+/// as proof.
 ///
-/// The drop is driven through the project-vs-process decision: a fill whose `ts_event`
-/// precedes the netting lifecycle start of a retained netting position is PROJECTED
-/// (`should_project_reconciliation_fill`) rather than applied, which leaves the order
-/// terminal without the execution's trade id recorded - the production state.
+/// OBSERVED: cache exposure equals the venue's (both 1.000) - this ordering is already
+/// safe. The offline harness cannot reach the incident's cross-call drop.
+///
+/// WHY THE INCIDENT SHAPE IS NOT REPRODUCIBLE OFFLINE - both authorised levers were
+/// attempted and both failed:
+///
+/// - Lever (a), the project-vs-process decision (`should_project_reconciliation_fill`):
+///   a retained netting position whose `ts_opened` is AFTER the batch fill's `ts_event`
+///   does make the fill a projection rather than an application, but the position report
+///   then MATCHES the cached quantity, so materialisation never runs and the fill stays
+///   registered on the order (`trade_ids` = 1). The unregistered-execution-id state is
+///   never produced.
+/// - Lever (b), the orphan/unclaimed path (no order report,
+///   `filter_unclaimed_external_orders`): this DOES drop the execution while the position
+///   report still materialises exposure, which without the correction yields cache 2 for
+///   venue 1 - the precondition. However the venue's own fill report rides in the same
+///   batch, so the execution is accounted for within the SAME reconcile call
+///   (`processed_fills` is populated during materialisation) and the cache stays equal to
+///   the venue.
+///
+/// The production incident SPANS calls instead: the terminal order state came from a
+/// projected/inferred fill whose `InvalidStateTrigger` rejection left the venue execution
+/// id unregistered, and a later re-delivery was applied on top. Forcing that cross-call
+/// drop deterministically through the manager's public API was not possible.
+///
+/// Production confirmation therefore rests with the campaign (t13/t14/t18): a reconnect
+/// against a pre-existing exposure must end with cache exposure EQUAL to the venue's and
+/// `net_position` NEVER exceeding it.
 #[tokio::test]
-#[ignore = "Defect C residual gap: this incident shape is NOT repaired by the prepared correction. \
-            See TEST_PLAN_C.md case 5 and the t11 completion report. The test documents the \
-            observed RED state (cache 2 for venue 1) rather than asserting a passing fix."]
+#[ignore = "Defect C residual gap: the incident's cross-call InvalidStateTrigger drop is not \
+            reachable offline, so this case is not RED without the correction. It records the \
+            observed result (cache == venue == 1) and the two failed levers rather than \
+            asserting a passing fix. See TEST_PLAN_C.md case 5."]
 async fn test_reconnect_with_filled_order_history_does_not_double_count() {
     let mut ctx = TestContext::new();
     let instrument = test_instrument();
@@ -8875,9 +8899,8 @@ async fn test_reconnect_with_filled_order_history_does_not_double_count() {
         .register_oms_type(strategy_id, OmsType::Netting);
 
     // Reconnect batch: the venue reports the real execution and the position that
-    // execution produced, but supplies NO order report for it. The execution is
-    // therefore dropped (the orphan-fill path cannot materialise an order for a fill
-    // with no venue position id), leaving the venue execution id unregistered - the
+    // execution produced, but supplies NO order report for it, so the execution takes the
+    // orphan-fill path and is dropped, leaving the venue execution id unregistered - the
     // precondition of the incident.
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -8887,10 +8910,7 @@ async fn test_reconnect_with_filled_order_history_does_not_double_count() {
         Some(UUID4::new()),
     );
     // The venue reports the order as ALREADY FILLED and separately re-delivers the
-    // execution. The order report therefore leaves the order terminal before the
-    // execution is applied, and applying the execution to that terminal order is
-    // rejected with InvalidStateTrigger - the venue execution id is dropped and is
-    // registered nowhere. This is the exact `on1-exit-3` shape.
+    // execution, so the order is terminal before the execution is applied.
     let order_report = create_order_status_report(
         Some(ClientOrderId::from("c210-on1-replay")),
         venue_order_id,
