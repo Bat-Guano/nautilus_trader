@@ -3867,3 +3867,148 @@ async fn test_submit_order_list_send_success_emits_submitted_without_any_accepta
         );
     }
 }
+
+// --------------------------------------------------------------------------------------------- #
+// C2.10-E2-R7-ON1: a broker position must never be reconciled twice
+//
+// `generate_order_status_reports` emits synthetic reports derived from broker
+// positions so the engine learns about a position with no order history. Before
+// the correction the quantity already accounted for by the snapshot's own order
+// observations was accumulated from the OPEN-order observations only, so a
+// position whose only order evidence was a COMPLETED order was reconciled a
+// second time by a synthetic report. The engine then projected an external order
+// plus an inferred fill for the same share and applied the real order's fill on
+// top, leaving the node cache holding `LONG 2 SPY.ARCA` for a single owned share
+// while `reqPositions` reported 1.
+// --------------------------------------------------------------------------------------------- #
+
+const KNOWN_FILLS_INSTRUMENT: &str = "SPY.ARCA";
+
+fn known_fills_instrument_id() -> InstrumentId {
+    InstrumentId::from(KNOWN_FILLS_INSTRUMENT)
+}
+
+fn known_fills_report(
+    instrument_id: InstrumentId,
+    side: OrderSide,
+    filled_qty: f64,
+) -> OrderStatusReport {
+    let quantity = Quantity::new(filled_qty, 0);
+    OrderStatusReport::new(
+        AccountId::from("IB-001"),
+        instrument_id,
+        Some(ClientOrderId::from("c210-on1-e4")),
+        VenueOrderId::from("PERM-1"),
+        Some(side),
+        OrderType::Limit,
+        TimeInForce::Day,
+        OrderStatus::Filled,
+        quantity,
+        quantity,
+        UnixNanos::default(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    )
+}
+
+#[rstest]
+fn known_order_fills_offsets_a_long_position_by_its_completed_buy_fill() {
+    // The exact C2.10-E2-R7-ON1 shape: the only order evidence for the position
+    // is the completed, filled BUY. It must offset the position completely, so no
+    // synthetic position-derived report is emitted for it.
+    let reports = vec![known_fills_report(
+        known_fills_instrument_id(),
+        OrderSide::Buy,
+        1.0,
+    )];
+
+    let fills = accumulate_known_order_fills(&reports);
+
+    assert_eq!(
+        fills.get(&known_fills_instrument_id()).copied(),
+        Some(Decimal::from(1)),
+        "a completed BUY fill must be subtracted from the broker position"
+    );
+    assert!(
+        Decimal::from(1) - fills[&known_fills_instrument_id()] == Decimal::ZERO,
+        "the position of one must be fully accounted for, so it is never reconciled twice"
+    );
+}
+
+#[rstest]
+fn known_order_fills_signs_a_short_position_by_its_sell_fill() {
+    let reports = vec![known_fills_report(
+        known_fills_instrument_id(),
+        OrderSide::Sell,
+        1.0,
+    )];
+
+    let fills = accumulate_known_order_fills(&reports);
+
+    assert_eq!(
+        fills.get(&known_fills_instrument_id()).copied(),
+        Some(Decimal::from(-1)),
+        "a SELL fill offsets a short position, so its contribution is negative"
+    );
+    assert_eq!(
+        Decimal::from(-1) - fills[&known_fills_instrument_id()],
+        Decimal::ZERO,
+        "a short position of one is fully accounted for by its SELL fill"
+    );
+}
+
+#[rstest]
+fn known_order_fills_ignores_orders_that_have_not_filled() {
+    let reports = vec![known_fills_report(
+        known_fills_instrument_id(),
+        OrderSide::Buy,
+        0.0,
+    )];
+
+    let fills = accumulate_known_order_fills(&reports);
+
+    assert!(
+        fills.is_empty(),
+        "an unfilled order accounts for no quantity, so a position it does not \
+         explain must still be reported synthetically: {fills:?}"
+    );
+}
+
+#[rstest]
+fn known_order_fills_accumulates_across_orders_for_one_instrument() {
+    let reports = vec![
+        known_fills_report(known_fills_instrument_id(), OrderSide::Buy, 1.0),
+        known_fills_report(known_fills_instrument_id(), OrderSide::Buy, 4.0),
+    ];
+
+    let fills = accumulate_known_order_fills(&reports);
+
+    assert_eq!(
+        fills.get(&known_fills_instrument_id()).copied(),
+        Some(Decimal::from(5)),
+        "two owned quantity-one entries net to the aggregate position"
+    );
+}
+
+#[rstest]
+fn known_order_fills_keeps_instruments_isolated() {
+    let other = InstrumentId::from("QQQ.NASDAQ");
+    let reports = vec![
+        known_fills_report(known_fills_instrument_id(), OrderSide::Buy, 1.0),
+        known_fills_report(other, OrderSide::Buy, 2.0),
+    ];
+
+    let fills = accumulate_known_order_fills(&reports);
+
+    assert_eq!(
+        fills.get(&known_fills_instrument_id()).copied(),
+        Some(Decimal::from(1))
+    );
+    assert_eq!(fills.get(&other).copied(), Some(Decimal::from(2)));
+    assert_eq!(
+        fills.len(),
+        2,
+        "one instrument's fill must never offset another instrument's position"
+    );
+}

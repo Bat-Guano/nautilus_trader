@@ -353,6 +353,11 @@ pub struct OrderReportObservation {
 /// * `account_id` is the configured Nautilus account identity, accepted only
 ///   when the record's broker account matches it exactly.
 ///
+/// The report's total quantity is broker evidence too, but a completed-order
+/// record does not carry it directly. It is reconstructed from the record's own
+/// filled and remaining quantities so the published report can never claim more
+/// filled than total; see the quantity repair in the body.
+///
 /// # Errors
 ///
 /// Returns an error when the record cannot support a safe reconciliation report.
@@ -468,6 +473,31 @@ pub fn parse_completed_order_to_report(
         report.client_order_id.is_some(),
         "IBKR completed order produced a report without client order identity",
     );
+
+    // IBKR leaves the total quantity unset on a completed-order record: the
+    // record carries the filled quantity and the terminal status while
+    // `Order.total_quantity` stays at its zero default. Publishing that zero
+    // produces an internally contradictory report - a filled order whose filled
+    // quantity exceeds its total quantity - and every accepted consumer fails
+    // closed on exactly that shape: the core reconciliation skips the order as a
+    // non-positive quantity, and the C2.7/C2.8 ingress rejects it with
+    // `INVALID_BROKER_QUANTITY`. The broker's own fill evidence would then never
+    // be ingested, which is what left a real overnight fill unobserved.
+    //
+    // The record's total is recoverable from the record itself: a completed
+    // order's total quantity is exactly what it filled plus what remained. The
+    // repair only ever raises the total to cover the quantities the broker
+    // reported, so a record that already carries a usable total is published
+    // unchanged and a live order's total is never inflated.
+    let implied_total =
+        order.filled_quantity + (order.total_quantity - order.filled_quantity).max(0.0);
+
+    if decimal_from_f64(implied_total)? > report.quantity.as_decimal() {
+        let size_precision = instrument_provider
+            .find(&instrument_id)
+            .map_or(0, |instrument| instrument.size_precision());
+        report.quantity = Quantity::new(implied_total, size_precision);
+    }
 
     Ok(report)
 }
@@ -1796,6 +1826,66 @@ mod completed_order_report_tests {
 
         assert_eq!(report.order_status, NautilusOrderStatus::Filled);
         assert_eq!(report.filled_qty.as_f64(), 100.0);
+    }
+
+    /// A completed-order record exactly as IBKR delivered it for the C2.10-E2-R7
+    /// overnight fill: the broker reported the fill and the terminal status but
+    /// left `Order.total_quantity` at its zero default.
+    fn completed_filled_order_without_broker_total_quantity(filled_qty: f64) -> OrderData {
+        let mut data = completed_order_data(OrderStatusKind::Filled, filled_qty, PERM_ID);
+        data.order.total_quantity = 0.0;
+        data
+    }
+
+    #[rstest]
+    fn test_completed_filled_order_without_broker_total_quantity_still_carries_the_fill() {
+        let report = convert(&completed_filled_order_without_broker_total_quantity(1.0)).unwrap();
+
+        assert_eq!(report.filled_qty.as_f64(), 1.0);
+        assert_eq!(report.order_status, NautilusOrderStatus::Filled);
+        assert_eq!(report.venue_order_id, venue_order_id(PERM_ID));
+        assert_eq!(
+            report.quantity.as_f64(),
+            1.0,
+            "a completed filled order must never report more filled than total: the core \
+             reconciliation skips such an order as a non-positive quantity and the \
+             C2.7/C2.8 ingress rejects it with INVALID_BROKER_QUANTITY, so the broker's \
+             own fill evidence would never be ingested"
+        );
+        assert!(
+            report.filled_qty <= report.quantity,
+            "the published report must be internally consistent"
+        );
+    }
+
+    #[rstest]
+    #[case(1.0)]
+    #[case(7.0)]
+    #[case(100.0)]
+    fn test_completed_filled_order_total_quantity_always_covers_the_fill(#[case] filled_qty: f64) {
+        let report = convert(&completed_filled_order_without_broker_total_quantity(
+            filled_qty,
+        ))
+        .unwrap();
+
+        assert_eq!(report.quantity.as_f64(), filled_qty);
+        assert!(report.filled_qty <= report.quantity);
+    }
+
+    #[rstest]
+    fn test_completed_order_with_a_broker_total_quantity_is_published_unchanged() {
+        // The record already carries a usable total, so the repair must not touch
+        // it: this is the ordinary completed-order shape and it stays byte-for-byte
+        // what the broker reported.
+        let report = convert(&completed_order_data(
+            OrderStatusKind::Filled,
+            40.0,
+            PERM_ID,
+        ))
+        .unwrap();
+
+        assert_eq!(report.quantity.as_f64(), 100.0);
+        assert_eq!(report.filled_qty.as_f64(), 40.0);
     }
 
     #[rstest]

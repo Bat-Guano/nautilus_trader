@@ -884,7 +884,6 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .context("Timeout requesting open orders")??;
         let mut subscription = subscription.filter_data();
         let mut open_observations = Vec::new();
-        let mut open_order_fills: AHashMap<InstrumentId, Decimal> = AHashMap::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let raw_account_id = raw_ib_account_code(&self.core.account_id);
 
@@ -943,17 +942,6 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         ts_init,
                     ) {
                         Ok(report) => {
-                            if !cmd.open_only && report.filled_qty.as_decimal() > Decimal::ZERO {
-                                let signed_filled = if report.order_side == Some(OrderSide::Buy) {
-                                    report.filled_qty.as_decimal()
-                                } else {
-                                    -report.filled_qty.as_decimal()
-                                };
-                                open_order_fills
-                                    .entry(report.instrument_id)
-                                    .and_modify(|qty| *qty += signed_filled)
-                                    .or_insert(signed_filled);
-                            }
                             open_observations.push(OrderReportObservation {
                                 report,
                                 broker_perm_id: broker_perm_id(data.order.perm_id),
@@ -985,6 +973,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 .await
         };
         let mut reports = merge_order_status_reports(open_observations, completed_observations);
+        let known_order_fills = if cmd.open_only {
+            AHashMap::new()
+        } else {
+            accumulate_known_order_fills(&reports)
+        };
 
         if !cmd.open_only {
             let positions = tokio::time::timeout(timeout_dur, client.positions())
@@ -1033,11 +1026,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
                         let position_qty =
                             Decimal::from_f64_retain(position.position).unwrap_or_default();
-                        let open_fills = open_order_fills
+                        let known_fills = known_order_fills
                             .get(&instrument_id)
                             .copied()
                             .unwrap_or_default();
-                        let adjusted_qty = position_qty - open_fills;
+                        let adjusted_qty = position_qty - known_fills;
                         if adjusted_qty.is_zero() {
                             continue;
                         }
@@ -1853,6 +1846,50 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         }
         Ok(())
     }
+}
+
+/// The signed filled quantity each instrument's own order observations already
+/// account for.
+///
+/// `generate_order_status_reports` additionally emits synthetic reports derived
+/// from broker positions, so the engine learns about a position that has no
+/// order history of its own. When the snapshot *does* carry an order observation
+/// for the position - an open order, or a completed order that has left the
+/// open-order book - that observation is the authoritative account of the
+/// quantity, and emitting a synthetic report for it as well reconciles the same
+/// exposure twice: the engine projects an external order plus an inferred fill
+/// from the synthetic report and then applies the real order's fill on top, so a
+/// single owned share is held as a position of two and every position gate
+/// downstream disagrees with the broker.
+///
+/// The caller passes the **merged** observations, so an order IBKR reports from
+/// both the open-order and completed-order sources is counted once: the merge
+/// already collapses those into a single report per logical order.
+///
+/// The sign follows the order side, so a long position is offset by its BUY
+/// fills and a short position by its SELL fills.
+fn accumulate_known_order_fills(reports: &[OrderStatusReport]) -> AHashMap<InstrumentId, Decimal> {
+    let mut fills: AHashMap<InstrumentId, Decimal> = AHashMap::new();
+
+    for report in reports {
+        let filled = report.filled_qty.as_decimal();
+
+        if filled <= Decimal::ZERO {
+            continue;
+        }
+
+        let signed_filled = if report.order_side == Some(OrderSide::Buy) {
+            filled
+        } else {
+            -filled
+        };
+        fills
+            .entry(report.instrument_id)
+            .and_modify(|qty| *qty += signed_filled)
+            .or_insert(signed_filled);
+    }
+
+    fills
 }
 
 fn validate_order(order: &impl Order) -> Result<(), OrderDeniedReason> {
