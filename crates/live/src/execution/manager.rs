@@ -1219,10 +1219,17 @@ impl ExecutionManager {
                         continue;
                     }
 
+                    let accounted_fill_keys = Self::accounted_by_position_snapshot(
+                        &mass_status,
+                        &report,
+                        mass_status.account_id,
+                    );
+
                     if let Some(position_events) = self.reconcile_position_report(
                         &report,
                         mass_status.account_id,
                         &instruments_with_unattributed_fills,
+                        &accounted_fill_keys,
                     ) {
                         for event in position_events {
                             exec_engine.borrow_mut().process(&event);
@@ -4273,11 +4280,17 @@ impl ExecutionManager {
     ///
     /// This handles the case where the venue reports an open position but there are
     /// no order or fill reports to create it from (e.g., orders are already closed).
+    ///
+    /// `accounted_fill_keys` carries the identities of venue executions that the
+    /// snapshot already includes. They are recorded as processed so that a later
+    /// replay of one of those executions cannot be applied on top of the position
+    /// this call materialises.
     fn create_position_from_report(
-        &self,
+        &mut self,
         report: &PositionStatusReport,
         account_id: AccountId,
         instrument: &InstrumentAny,
+        accounted_fill_keys: &IndexSet<FillKey>,
     ) -> Option<Vec<OrderEventAny>> {
         let instrument_id = report.instrument_id;
         let venue_signed_qty = report.signed_decimal_qty;
@@ -4347,14 +4360,36 @@ impl ExecutionManager {
             None,
             None,
         );
+
+        // The venue snapshot already carries this exposure, so every execution it
+        // accounts for is now represented by the position just materialised. Record
+        // those identities as processed: a replayed execution report for any of them
+        // must not be applied again on top of the materialised position.
+        let mut newly_accounted = 0usize;
+
+        for fill_key in accounted_fill_keys {
+            if !self.processed_fills.contains_key(fill_key) {
+                self.processed_fills.mark(*fill_key);
+                newly_accounted += 1;
+            }
+        }
+
+        if newly_accounted > 0 {
+            log::info!(
+                color = LogColor::Blue as u8;
+                "Materialised position for {instrument_id} accounts for {newly_accounted} venue execution(s); replays will be deduplicated",
+            );
+        }
+
         Some(events)
     }
 
     fn reconcile_position_report(
-        &self,
+        &mut self,
         report: &PositionStatusReport,
         account_id: AccountId,
         instruments_with_unattributed_fills: &IndexSet<InstrumentId>,
+        accounted_fill_keys: &IndexSet<FillKey>,
     ) -> Option<Vec<OrderEventAny>> {
         if report.venue_position_id.is_some() {
             self.reconcile_position_report_hedging(
@@ -4363,8 +4398,36 @@ impl ExecutionManager {
                 instruments_with_unattributed_fills,
             )
         } else {
-            self.reconcile_position_report_netting(report, account_id)
+            self.reconcile_position_report_netting(report, account_id, accounted_fill_keys)
         }
+    }
+
+    /// Returns the venue executions already accounted for by a position snapshot.
+    ///
+    /// A position snapshot reports the venue's exposure as of `boundary`. Every
+    /// execution reported in the same batch with a timestamp at or before that
+    /// boundary is already included in the snapshot's quantity, so materialising
+    /// the snapshot also accounts for them. Returning those identities lets the
+    /// materialisation seed the processed-fill state with the venue's own trade
+    /// IDs, so a later replay of any of those executions is recognised instead of
+    /// being applied a second time on top of the materialised exposure.
+    fn accounted_by_position_snapshot(
+        mass_status: &ExecutionMassStatus,
+        report: &PositionStatusReport,
+        account_id: AccountId,
+    ) -> IndexSet<FillKey> {
+        let boundary = report.ts_last;
+        mass_status
+            .fill_reports()
+            .values()
+            .flatten()
+            .filter(|fill| {
+                fill.account_id == account_id
+                    && fill.instrument_id == report.instrument_id
+                    && fill.ts_event <= boundary
+            })
+            .map(|fill| (fill.account_id, fill.instrument_id, fill.trade_id))
+            .collect()
     }
 
     fn reconcile_position_report_hedging(
@@ -4527,9 +4590,10 @@ impl ExecutionManager {
     }
 
     fn reconcile_position_report_netting(
-        &self,
+        &mut self,
         report: &PositionStatusReport,
         account_id: AccountId,
+        accounted_fill_keys: &IndexSet<FillKey>,
     ) -> Option<Vec<OrderEventAny>> {
         let instrument_id = report.instrument_id;
 
@@ -4621,7 +4685,12 @@ impl ExecutionManager {
         }
 
         if cached_signed_qty == Decimal::ZERO {
-            return self.create_position_from_report(report, account_id, &instrument);
+            return self.create_position_from_report(
+                report,
+                account_id,
+                &instrument,
+                accounted_fill_keys,
+            );
         }
 
         self.create_position_reconciliation_order(
@@ -7131,7 +7200,7 @@ mod tests {
                 },
                 SourcedOrderStatusReport {
                     client_id,
-                    report: reconciled_report.clone(),
+                    report: reconciled_report,
                 },
             ],
             &IndexSet::from([client_id]),
@@ -8869,5 +8938,192 @@ mod tests {
         let order_filled: OrderFilled = fill.into();
         position.apply(&order_filled);
         position
+    }
+
+    /// The enforcement mechanism for the reconnect double-count.
+    ///
+    /// Once a venue execution is recorded as accounted for, a replay of that same
+    /// execution must not produce another fill event. This is the guard the position
+    /// materialisation relies on: it records the executions a venue snapshot already
+    /// covers, so a later replay of one of them is deduplicated here.
+    #[rstest]
+    fn test_create_order_fill_dedupes_accounted_execution() {
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(Cache::default())),
+            ExecutionManagerConfig::default(),
+        )
+        .expect("valid config");
+
+        let instrument = crypto_perpetual_ethusdt();
+        let account_id = AccountId::from("TEST-001");
+        let trade_id = TradeId::from("T-ACCOUNTED-001");
+        let fill = FillReport::new(
+            account_id,
+            instrument.id(),
+            VenueOrderId::from("V-ACCOUNTED-001"),
+            trade_id,
+            OrderSide::Buy,
+            Quantity::from("1.000"),
+            Price::from("3000.00"),
+            Money::from("0.50 USDT"),
+            LiquiditySide::Maker,
+            None,
+            None,
+            UnixNanos::from(1_000_000),
+            UnixNanos::from(1_000_000),
+            None,
+        );
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .build();
+
+        // An execution not yet accounted for still produces a fill event.
+        let prepared = manager
+            .create_order_fill(
+                &order,
+                &fill,
+                &InstrumentAny::CryptoPerpetual(instrument.clone()),
+                &IndexSet::new(),
+            )
+            .expect("an unaccounted execution produces a fill event");
+        assert_eq!(prepared.1, (account_id, instrument.id(), trade_id));
+
+        // Recorded as accounted for by a venue snapshot: the replay is deduplicated.
+        manager
+            .processed_fills
+            .mark((account_id, instrument.id(), trade_id));
+
+        assert!(
+            manager
+                .create_order_fill(
+                    &order,
+                    &fill,
+                    &InstrumentAny::CryptoPerpetual(instrument),
+                    &IndexSet::new(),
+                )
+                .is_none(),
+            "an accounted execution must not be replayed on top of the snapshot",
+        );
+    }
+
+    /// Materialising a position from a venue snapshot records every execution the
+    /// snapshot already covers as accounted for. This is the state that makes the
+    /// replay above deduplicate, and it must be limited to executions at or before
+    /// the snapshot boundary.
+    #[rstest]
+    fn test_create_position_from_report_records_snapshot_accounted_executions() {
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let account_id = AccountId::from("TEST-001");
+        let venue_order_id = VenueOrderId::from("V-SNAPSHOT-001");
+        let boundary = UnixNanos::from(1_000_000);
+        let covered_trade_id = TradeId::from("T-COVERED-001");
+        let later_trade_id = TradeId::from("T-LATER-001");
+
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .expect("instrument is added");
+
+        let mut manager = ExecutionManager::new(clock, cache, ExecutionManagerConfig::default())
+            .expect("valid config");
+
+        let position_report = PositionStatusReport::new(
+            account_id,
+            instrument_id,
+            PositionSide::Long,
+            Quantity::from("1.000"),
+            boundary,
+            boundary,
+            None,
+            None,
+            Some(dec!(3000.00)),
+        );
+
+        let mut mass_status = ExecutionMassStatus::new(
+            ClientId::from("TEST"),
+            account_id,
+            Venue::from("TEST"),
+            UnixNanos::default(),
+            Some(UUID4::new()),
+        );
+        mass_status.add_fill_reports(vec![
+            FillReport::new(
+                account_id,
+                instrument_id,
+                venue_order_id,
+                covered_trade_id,
+                OrderSide::Buy,
+                Quantity::from("1.000"),
+                Price::from("3000.00"),
+                Money::from("0.50 USDT"),
+                LiquiditySide::Maker,
+                None,
+                None,
+                boundary,
+                boundary,
+                None,
+            ),
+            // Strictly after the snapshot boundary: not covered by the snapshot.
+            FillReport::new(
+                account_id,
+                instrument_id,
+                venue_order_id,
+                later_trade_id,
+                OrderSide::Buy,
+                Quantity::from("1.000"),
+                Price::from("3000.00"),
+                Money::from("0.50 USDT"),
+                LiquiditySide::Maker,
+                None,
+                None,
+                UnixNanos::from(2_000_000),
+                UnixNanos::from(2_000_000),
+                None,
+            ),
+        ]);
+
+        let accounted = ExecutionManager::accounted_by_position_snapshot(
+            &mass_status,
+            &position_report,
+            account_id,
+        );
+
+        assert!(
+            accounted.contains(&(account_id, instrument_id, covered_trade_id)),
+            "an execution at the snapshot boundary is accounted for by the snapshot",
+        );
+        assert!(
+            !accounted.contains(&(account_id, instrument_id, later_trade_id)),
+            "an execution after the snapshot boundary must not be treated as covered",
+        );
+
+        let instrument = manager
+            .get_instrument(&instrument_id)
+            .expect("instrument is present");
+
+        manager
+            .create_position_from_report(&position_report, account_id, &instrument, &accounted)
+            .expect("position materialises from the report");
+
+        assert!(
+            manager
+                .processed_fills
+                .contains_key(&(account_id, instrument_id, covered_trade_id)),
+            "the covered execution is recorded as accounted for",
+        );
+        assert!(
+            !manager
+                .processed_fills
+                .contains_key(&(account_id, instrument_id, later_trade_id)),
+            "an execution after the boundary stays unaccounted and remains applicable",
+        );
     }
 }
