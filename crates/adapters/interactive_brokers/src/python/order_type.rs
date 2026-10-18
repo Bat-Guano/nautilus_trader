@@ -13,18 +13,32 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Python bindings for inbound IBKR order-type classification and refusal (CWR-01B-O3-R1).
+//! Python bindings for inbound IBKR order parsing, classification and refusal
+//! (CWR-01B-O3-R1, CWR-01B-O3-R2).
 //!
 //! Each binding projects a decision which already exists in Rust and is already
 //! applied on the inbound paths: [`classify_ib_order_type`] classifies a wire
 //! value, [`project_ib_order_type`] resolves the canonical projection or refuses
 //! it, [`IbOrderTypeRefusal`] carries that refusal, [`is_usable_ib_price`] guards
-//! broker price fields, and [`ib_open_order_price_shape`] is the S2 open-order
-//! price decision. Nothing here restates a rule, so a Python consumer cannot
+//! broker price fields, [`ib_open_order_price_shape`] is the S2 open-order price
+//! decision, and [`parse_order_status_to_report`] is the S1 inbound order-report
+//! parser itself. Nothing here restates a rule, so a Python consumer cannot
 //! disagree with the adapter about what an inbound order means.
 
-use nautilus_model::{enums::OrderType, types::Price};
-use pyo3::{prelude::*, types::PyDict};
+use std::str::FromStr;
+
+use ibapi::orders::{Action, Order, OrderStatus, OrderStatusKind, TimeInForce};
+use nautilus_core::UnixNanos;
+use nautilus_model::{
+    enums::OrderType,
+    identifiers::{AccountId, InstrumentId},
+    types::Price,
+};
+use pyo3::{
+    exceptions::{PyRuntimeError, PyValueError},
+    prelude::*,
+    types::PyDict,
+};
 
 use crate::{
     common::{
@@ -33,7 +47,9 @@ use crate::{
         },
         parse::is_usable_ib_price,
     },
-    execution::parse::ib_open_order_price_shape,
+    config::InteractiveBrokersInstrumentProviderConfig,
+    execution::parse::{ib_open_order_price_shape, parse_order_status_to_report},
+    providers::instruments::InteractiveBrokersInstrumentProvider,
 };
 
 /// The five classes of [`IbOrderTypeClass`], as a Python-visible enum.
@@ -277,4 +293,187 @@ pub fn py_ib_open_order_price_shape(
         price_precision,
         order_id,
     )
+}
+
+/// Runs the actual inbound IBKR order-status parser on a deterministic fixture.
+///
+/// This binding exists to make the production inbound parser
+/// ([`parse_order_status_to_report`], S1 in the adapter) executable from an
+/// offline Python process. It builds the genuine rust-ibapi
+/// `ibapi::orders::Order` and `ibapi::orders::OrderStatus` values the inbound
+/// path consumes from the supplied IBKR wire fields, then calls the parser with
+/// an empty, offline instrument provider (no broker, no cache, no connection).
+///
+/// Returns the parser's real `OrderStatusReport` when the broker evidence
+/// supports a canonical report. When the wire order type cannot be truthfully
+/// projected, the parser refuses; the same decision is taken here through
+/// [`project_ib_order_type`] (the function S1 itself calls, with the same raw
+/// value and the same identifiers), and the typed [`IbOrderTypeRefusal`] is
+/// returned after checking that the parser's own refusal text is that value's
+/// text. A parser failure for any other reason is raised as an exception — it is
+/// never converted into a canonical order type or into a type refusal.
+///
+/// The raw wire strings (`order_type`, `status`) are preserved byte-for-byte and
+/// reach the report as `raw_order_type` / `raw_order_status`. Order identity
+/// (`order_id`, `perm_id`) is carried into the refusal so a refusal stays
+/// correlatable with the broker order it belongs to.
+///
+/// # Errors
+///
+/// Raises `ValueError` for an input the inbound wire decoder could not produce
+/// (an out-of-vocabulary action, an empty order status, an unparsable instrument
+/// or account id), and `RuntimeError` if the parser fails for a reason other than
+/// the order-type projection.
+#[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(
+    module = "nautilus_trader.adapters.interactive_brokers"
+)]
+#[pyo3(name = "parse_ib_order_status_report")]
+#[pyo3(signature = (
+    order_type,
+    total_quantity,
+    instrument_id,
+    account_id,
+    ts_init,
+    action="BUY",
+    limit_price=None,
+    aux_price=None,
+    trail_stop_price=None,
+    trailing_percent=None,
+    limit_price_offset=None,
+    tif="DAY",
+    good_till_date="",
+    order_ref="",
+    order_id=0,
+    perm_id=0,
+    status="Submitted",
+    filled=0.0,
+    remaining=0.0,
+    average_fill_price=None,
+))]
+#[expect(clippy::too_many_arguments)]
+pub fn py_parse_ib_order_status_report(
+    py: Python<'_>,
+    order_type: &str,
+    total_quantity: f64,
+    instrument_id: &str,
+    account_id: &str,
+    ts_init: u64,
+    action: &str,
+    limit_price: Option<f64>,
+    aux_price: Option<f64>,
+    trail_stop_price: Option<f64>,
+    trailing_percent: Option<f64>,
+    limit_price_offset: Option<f64>,
+    tif: &str,
+    good_till_date: &str,
+    order_ref: &str,
+    order_id: i32,
+    perm_id: i64,
+    status: &str,
+    filled: f64,
+    remaining: f64,
+    average_fill_price: Option<f64>,
+) -> PyResult<Py<PyAny>> {
+    // Decode the action exactly as the inbound wire vocabulary defines it. The
+    // rust-ibapi `Action::from(&str)` is `todo!()`-unreachable out of vocabulary,
+    // so decoding here keeps a malformed fixture observable instead of panicking.
+    let action = match action {
+        "BUY" => Action::Buy,
+        "SELL" => Action::Sell,
+        "SSHORT" => Action::SellShort,
+        "SLONG" => Action::SellLong,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unrecognized IBKR order action {other:?}"
+            )));
+        }
+    };
+
+    // The genuine production `Order` value the inbound parser consumes. Every
+    // field the parser reads is set from the fixture; the rest keep the type's
+    // documented defaults, exactly as the reviewed Rust contract tests do.
+    let order = Order {
+        action,
+        total_quantity,
+        order_type: order_type.to_owned(),
+        limit_price,
+        aux_price,
+        tif: TimeInForce::from(tif),
+        good_till_date: good_till_date.to_owned(),
+        order_ref: order_ref.to_owned(),
+        trail_stop_price,
+        trailing_percent,
+        limit_price_offset,
+        ..Default::default()
+    };
+
+    // The production wire decoder: known statuses map to their reviewed value,
+    // an unknown non-empty wire value is preserved byte-for-byte, and only the
+    // empty string (a missing required wire field) is an error.
+    let status = OrderStatusKind::from_str(status).map_err(|e| {
+        PyValueError::new_err(format!(
+            "unrecognized IBKR order status wire value {status:?}: {e}"
+        ))
+    })?;
+
+    let order_status = OrderStatus {
+        order_id,
+        status,
+        filled,
+        remaining,
+        average_fill_price,
+        perm_id,
+        ..Default::default()
+    };
+
+    let instrument_id = InstrumentId::from_str(instrument_id).map_err(|e| {
+        PyValueError::new_err(format!("invalid instrument id {instrument_id:?}: {e}"))
+    })?;
+    let account_id = AccountId::new_checked(account_id)
+        .map_err(|e| PyValueError::new_err(format!("invalid account id {account_id:?}: {e}")))?;
+
+    // Offline, empty provider: no broker connection, no instrument cache. The
+    // parser therefore uses its documented defaults (price magnifier 1, zero
+    // precision) exactly as the reviewed Rust contract tests do.
+    let provider = InteractiveBrokersInstrumentProvider::new(
+        InteractiveBrokersInstrumentProviderConfig::default(),
+    );
+
+    // The identical decision S1 takes over the same evidence and identifiers
+    // (`parse.rs` passes `order.limit_price`, the API order id and the perm id).
+    let projection = project_ib_order_type(
+        &order.order_type,
+        order.limit_price,
+        Some(i64::from(order_status.order_id)),
+        Some(order_status.perm_id),
+    );
+
+    match parse_order_status_to_report(
+        &order_status,
+        Some(&order),
+        instrument_id,
+        account_id,
+        &provider,
+        UnixNanos::new(ts_init),
+    ) {
+        Ok(report) => Ok(Py::new(py, report)?.into_any()),
+        Err(err) => match projection {
+            // S1 refused for the order type. Return the same typed refusal value,
+            // but only after proving S1's own text is that refusal: a different
+            // parser failure must never be disguised as a type refusal.
+            Err(refusal) => {
+                let parser_reason = err.to_string();
+                let refusal_reason = refusal.to_string();
+                if parser_reason != refusal_reason {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "IBKR inbound parser refused for a reason other than the order-type projection: {parser_reason}"
+                    )));
+                }
+
+                Ok(Py::new(py, refusal)?.into_any())
+            }
+            Ok(_) => Err(PyRuntimeError::new_err(err.to_string())),
+        },
+    }
 }

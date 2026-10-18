@@ -170,6 +170,10 @@ pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
         crate::python::order_type::py_ib_open_order_price_shape,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::order_type::py_parse_ib_order_status_report,
+        m
+    )?)?;
 
     let registry = get_global_pyo3_registry();
 
