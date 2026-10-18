@@ -11,10 +11,7 @@ use ibapi::subscriptions::SubscriptionItem;
 
 use super::*;
 use crate::{
-    common::{
-        enums::{IbAction, IbOrderStatus, classify_ib_order_type},
-        parse::usable_ib_order_price,
-    },
+    common::enums::{IbAction, IbOrderStatus},
     execution::parse,
 };
 
@@ -434,46 +431,22 @@ impl InteractiveBrokersExecutionClient {
 
     /// Returns the `(price, trigger_price)` shape for an `OrderUpdated` event.
     ///
-    /// For a wire type with a truthful canonical mapping, the shape is selected
-    /// by type exactly as before. For a wire type with no canonical mapping the
-    /// function must not claim one (CWR-01B D1 identical-rule requirement):
-    /// it carries only the prices IBKR actually reported, guarded by the same
-    /// usable-price predicate as the report path, and logs the wire type so the
-    /// unsupported observation stays visible.
+    /// The decision itself lives in `parse::ib_open_order_price_shape`, which is
+    /// also reachable from the Python surface (CWR-01B-O3-R1), so the shape a
+    /// Python consumer observes is the shape this path sends.
     fn open_order_price_fields(
         order_data: &ibapi::orders::OrderData,
         price_magnifier: f64,
         price_precision: u8,
     ) -> (Option<Price>, Option<Price>) {
-        let wire_order_type = order_data.order.order_type.as_str();
-        let order_type_class =
-            classify_ib_order_type(wire_order_type, order_data.order.limit_price);
-        let price = usable_ib_order_price(
+        parse::ib_open_order_price_shape(
+            order_data.order.order_type.as_str(),
             order_data.order.limit_price,
+            order_data.order.aux_price,
             price_magnifier,
             price_precision,
-        );
-        let trigger_price =
-            usable_ib_order_price(order_data.order.aux_price, price_magnifier, price_precision);
-
-        match order_type_class.canonical() {
-            Some(OrderType::Market | OrderType::MarketToLimit | OrderType::TrailingStopMarket) => {
-                (None, None)
-            }
-            Some(OrderType::Limit | OrderType::TrailingStopLimit) => (price, None),
-            Some(OrderType::StopMarket | OrderType::MarketIfTouched) => (None, trigger_price),
-            Some(OrderType::StopLimit | OrderType::LimitIfTouched) => (price, trigger_price),
-            None => {
-                tracing::debug!(
-                    order_id = order_data.order_id,
-                    order_type = wire_order_type,
-                    order_type_class = order_type_class.as_str(),
-                    "IBKR open order has no canonical Nautilus order type; carrying only the broker-reported prices",
-                );
-
-                (price, trigger_price)
-            }
-        }
+            Some(order_data.order_id),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

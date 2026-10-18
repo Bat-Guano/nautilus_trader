@@ -564,6 +564,105 @@ pub fn classify_ib_order_type(wire: &str, limit_price: Option<f64>) -> IbOrderTy
     }
 }
 
+/// A refused canonical projection for an inbound IBKR order type (CWR-01B-O3-R1).
+///
+/// The refusal is a value rather than a message: [`project_ib_order_type`]
+/// returns it, the inbound order-report path refuses with its [`Display`] text,
+/// and the Python-visible decision surface hands the same value to a Python
+/// consumer. Both therefore name one reason, not two transcriptions of one.
+///
+/// `order_id` and `perm_id` carry whatever broker identifiers the caller holds,
+/// so a refusal can be correlated with the order it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers",
+        from_py_object,
+        eq,
+        frozen
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
+    )
+)]
+pub struct IbOrderTypeRefusal {
+    /// The exact raw IBKR order-type wire value.
+    pub raw_order_type: String,
+    /// The classification which justifies no canonical type.
+    pub classification: IbOrderTypeClass,
+    /// The broker API order id, when one is known.
+    pub order_id: Option<i64>,
+    /// The broker permanent order id, when one is known.
+    pub perm_id: Option<i64>,
+}
+
+impl IbOrderTypeRefusal {
+    /// Creates a refusal of `raw_order_type` under `classification`.
+    #[must_use]
+    pub fn new(
+        raw_order_type: impl Into<String>,
+        classification: IbOrderTypeClass,
+        order_id: Option<i64>,
+        perm_id: Option<i64>,
+    ) -> Self {
+        Self {
+            raw_order_type: raw_order_type.into(),
+            classification,
+            order_id,
+            perm_id,
+        }
+    }
+}
+
+impl Display for IbOrderTypeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let order_id = self
+            .order_id
+            .map_or_else(|| "<unknown>".to_string(), |order_id| order_id.to_string());
+
+        write!(
+            f,
+            "IBKR inbound order {order_id} carries a {} order type {:?}; refusing to publish a fabricated canonical order type",
+            self.classification.as_str(),
+            self.raw_order_type,
+        )
+    }
+}
+
+/// Resolves the canonical projection for an inbound IBKR order type.
+///
+/// Every inbound path takes the canonical type through this decision: the wire
+/// value is classified, and a canonical type is claimed only when its class
+/// justifies one. `order_id` and `perm_id` are carried onto the refusal so a
+/// refusal stays correlatable with the order it belongs to.
+///
+/// # Errors
+///
+/// Returns the [`IbOrderTypeRefusal`] naming the exact raw value and its class
+/// when no canonical type is justified.
+pub fn project_ib_order_type(
+    raw_order_type: &str,
+    limit_price: Option<f64>,
+    order_id: Option<i64>,
+    perm_id: Option<i64>,
+) -> Result<NautilusOrderType, IbOrderTypeRefusal> {
+    let classification = classify_ib_order_type(raw_order_type, limit_price);
+
+    match classification.canonical() {
+        Some(order_type) => Ok(order_type),
+        None => Err(IbOrderTypeRefusal::new(
+            raw_order_type,
+            classification,
+            order_id,
+            perm_id,
+        )),
+    }
+}
+
 impl Display for IbOrderType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

@@ -40,7 +40,9 @@ use rust_decimal::Decimal;
 
 use crate::{
     common::{
-        enums::{IbAction, IbOrderStatus, IbTimeInForce, classify_ib_order_type},
+        enums::{
+            IbAction, IbOrderStatus, IbTimeInForce, classify_ib_order_type, project_ib_order_type,
+        },
         parse::{is_spread_instrument_id, usable_ib_order_price},
     },
     execution::account::raw_ib_account_code,
@@ -181,15 +183,19 @@ pub fn parse_order_status_to_report(
     // type when one is truthful. An unrecognized or unrepresentable wire type
     // is refused (never silently substituted): the raw value is named in the
     // error context so the outcome stays observable.
+    //
+    // CWR-01B-O3-R1: the refusal is taken through `project_ib_order_type`, so
+    // this path and the Python-visible decision surface refuse with one value
+    // and one wording rather than two transcriptions of one rule.
     let raw_order_type = order.order_type.clone();
-    let order_type_class = classify_ib_order_type(&raw_order_type, order.limit_price);
-    let Some(order_type) = order_type_class.canonical() else {
-        anyhow::bail!(
-            "IBKR inbound order {} carries a {} order type {:?}; refusing to publish a fabricated canonical order type",
-            order_status.order_id,
-            order_type_class.as_str(),
-            raw_order_type,
-        );
+    let order_type = match project_ib_order_type(
+        &raw_order_type,
+        order.limit_price,
+        Some(i64::from(order_status.order_id)),
+        Some(order_status.perm_id),
+    ) {
+        Ok(order_type) => order_type,
+        Err(refusal) => anyhow::bail!("{refusal}"),
     };
 
     // Get price magnifier from instrument provider
@@ -310,6 +316,57 @@ pub fn parse_order_status_to_report(
     }
 
     Ok(report)
+}
+
+/// Returns the `(price, trigger_price)` shape for an IBKR open-order update.
+///
+/// This is the S2 decision of the inbound open-order path expressed over the
+/// broker evidence alone, so it can be exercised without a broker connection.
+/// [`InteractiveBrokersExecutionClient::open_order_price_fields`] delegates to
+/// it, so the shape a Python consumer observes is the shape the adapter sends.
+///
+/// For a wire type with a truthful canonical mapping, the shape is selected by
+/// type exactly as before. For a wire type with no canonical mapping the
+/// function must not claim one (CWR-01B D1 identical-rule requirement): it
+/// carries only the prices IBKR actually reported, guarded by the same
+/// usable-price predicate as the report path, and logs the wire type so the
+/// unsupported observation stays visible.
+///
+/// `order_id` is carried for that observation log and is not a decision input;
+/// pass `None` when no broker order id is available.
+///
+/// [`InteractiveBrokersExecutionClient::open_order_price_fields`]: crate::execution::core_updates
+#[must_use]
+pub fn ib_open_order_price_shape(
+    raw_order_type: &str,
+    limit_price: Option<f64>,
+    aux_price: Option<f64>,
+    price_magnifier: f64,
+    price_precision: u8,
+    order_id: Option<i32>,
+) -> (Option<Price>, Option<Price>) {
+    let order_type_class = classify_ib_order_type(raw_order_type, limit_price);
+    let price = usable_ib_order_price(limit_price, price_magnifier, price_precision);
+    let trigger_price = usable_ib_order_price(aux_price, price_magnifier, price_precision);
+
+    match order_type_class.canonical() {
+        Some(OrderType::Market | OrderType::MarketToLimit | OrderType::TrailingStopMarket) => {
+            (None, None)
+        }
+        Some(OrderType::Limit | OrderType::TrailingStopLimit) => (price, None),
+        Some(OrderType::StopMarket | OrderType::MarketIfTouched) => (None, trigger_price),
+        Some(OrderType::StopLimit | OrderType::LimitIfTouched) => (price, trigger_price),
+        None => {
+            tracing::debug!(
+                order_id,
+                order_type = raw_order_type,
+                order_type_class = order_type_class.as_str(),
+                "IBKR open order has no canonical Nautilus order type; carrying only the broker-reported prices",
+            );
+
+            (price, trigger_price)
+        }
+    }
 }
 
 /// Returns the broker `perm_id` when it is a usable venue identity.

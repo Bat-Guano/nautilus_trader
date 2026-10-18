@@ -31,6 +31,7 @@ pub mod conversion;
 pub mod enums;
 pub mod factories;
 pub mod historical;
+pub mod order_type;
 pub mod providers;
 
 #[cfg(feature = "gateway")]
@@ -119,6 +120,8 @@ pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
     m.add_class::<crate::common::enums::IbOptionRight>()?;
     m.add_class::<crate::common::enums::IbOrderStatus>()?;
     m.add_class::<crate::common::enums::IbOrderType>()?;
+    m.add_class::<crate::common::enums::IbOrderTypeRefusal>()?;
+    m.add_class::<crate::python::order_type::PyIbOrderTypeClass>()?;
     m.add_class::<crate::common::enums::IbRealtimeBarSize>()?;
     m.add_class::<crate::common::enums::IbRealtimeWhatToShow>()?;
     m.add_class::<crate::common::enums::IbReferencePriceType>()?;
@@ -150,6 +153,23 @@ pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
         m.add_class::<crate::gateway::dockerized::ContainerStatus>()?;
         m.add_class::<crate::gateway::dockerized::DockerizedIBGateway>()?;
     }
+
+    m.add_function(wrap_pyfunction!(
+        crate::python::order_type::py_classify_ib_order_type,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::order_type::py_project_ib_order_type,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::order_type::py_is_usable_ib_price,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::order_type::py_ib_open_order_price_shape,
+        m
+    )?)?;
 
     let registry = get_global_pyo3_registry();
 
