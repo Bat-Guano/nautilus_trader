@@ -19,9 +19,45 @@ use std::{collections::HashMap, str::FromStr, sync::LazyLock};
 
 use ibapi::contracts::{Contract, Currency, Exchange, OptionRight, SecurityType, Symbol};
 use nautilus_core::UnixNanos;
-use nautilus_model::identifiers::{InstrumentId, Symbol as NautilusSymbol, TradeId, Venue};
+use nautilus_model::{
+    identifiers::{InstrumentId, Symbol as NautilusSymbol, TradeId, Venue},
+    types::Price,
+};
 
 use crate::common::enums::{IbOptionRight, IbSecurityType};
+
+/// Returns whether an IBKR wire price field carries a usable order price.
+///
+/// IBKR reports `0.0` for the price fields that do not apply to an order type
+/// and uses the unset `f64::MAX` sentinel that the client already normalizes to
+/// `None`. Only a finite, strictly positive value is a real limit, stop, trail
+/// or trigger price: a zero, negative, NaN or infinite value is an unset
+/// sentinel wearing a number, and attaching it would fabricate broker price
+/// state (CWR-01B O1).
+///
+/// This extends the discipline the fill-price path already applies
+/// (`should_use_avg_fill_price`), but without that path's spread exception: an
+/// average fill price of a spread instrument is legitimately negative, whereas
+/// an order price never is.
+#[must_use]
+pub(crate) fn is_usable_ib_price(value: f64) -> bool {
+    value.is_finite() && value > 0.0
+}
+
+/// Converts an IBKR wire price field into a [`Price`] when it carries a usable
+/// order price, and `None` otherwise.
+///
+/// See [`is_usable_ib_price`] for why unusable values must not be attached.
+#[must_use]
+pub(crate) fn usable_ib_order_price(
+    value: Option<f64>,
+    price_magnifier: f64,
+    price_precision: u8,
+) -> Option<Price> {
+    let value = value?;
+
+    is_usable_ib_price(value).then(|| Price::new(value * price_magnifier, price_precision))
+}
 
 fn ib_option_right_to_option_right(right: IbOptionRight) -> OptionRight {
     match right {

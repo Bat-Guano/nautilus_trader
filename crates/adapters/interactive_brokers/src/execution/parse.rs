@@ -28,7 +28,7 @@ use jiff::{
 use nautilus_core::{UnixNanos, datetime::get_timezone};
 use nautilus_model::{
     enums::{
-        LiquiditySide, OrderSide, OrderStatus as NautilusOrderStatus, OrderType, TimeInForce,
+        LiquiditySide, OrderStatus as NautilusOrderStatus, OrderType, TimeInForce,
         TrailingOffsetType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
@@ -40,8 +40,8 @@ use rust_decimal::Decimal;
 
 use crate::{
     common::{
-        enums::{IbAction, IbOrderStatus, IbOrderType, IbTimeInForce},
-        parse::is_spread_instrument_id,
+        enums::{IbAction, IbOrderStatus, IbTimeInForce, classify_ib_order_type},
+        parse::{is_spread_instrument_id, usable_ib_order_price},
     },
     execution::account::raw_ib_account_code,
     providers::instruments::InteractiveBrokersInstrumentProvider,
@@ -167,6 +167,31 @@ pub fn parse_order_status_to_report(
     // wire value byte-for-byte for known and unknown vocabulary alike.
     let raw_order_status = order_status.status.as_str().to_string();
 
+    // CWR-01B: the order object is the only evidence for the order's type,
+    // side and quantity. Publishing a report without it would require
+    // fabricating all three, so fail closed and name what is missing.
+    let Some(order) = order else {
+        anyhow::bail!(
+            "IBKR inbound order {} carries no order object; refusing to publish an order status report without order-type, side and quantity evidence",
+            order_status.order_id,
+        );
+    };
+
+    // CWR-01B: preserve the exact wire identifier and only claim a canonical
+    // type when one is truthful. An unrecognized or unrepresentable wire type
+    // is refused (never silently substituted): the raw value is named in the
+    // error context so the outcome stays observable.
+    let raw_order_type = order.order_type.clone();
+    let order_type_class = classify_ib_order_type(&raw_order_type, order.limit_price);
+    let Some(order_type) = order_type_class.canonical() else {
+        anyhow::bail!(
+            "IBKR inbound order {} carries a {} order type {:?}; refusing to publish a fabricated canonical order type",
+            order_status.order_id,
+            order_type_class.as_str(),
+            raw_order_type,
+        );
+    };
+
     // Get price magnifier from instrument provider
     let price_magnifier = instrument_provider.get_price_magnifier(&instrument_id) as f64;
 
@@ -182,12 +207,7 @@ pub fn parse_order_status_to_report(
     };
 
     // Get order side
-    let order_side = if let Some(order) = order {
-        IbAction::from(order.action).order_side()
-    } else {
-        // Default to Buy if order not available
-        OrderSide::Buy
-    };
+    let order_side = IbAction::from(order.action).order_side();
 
     let instrument = instrument_provider.find(&instrument_id);
 
@@ -200,11 +220,7 @@ pub fn parse_order_status_to_report(
         .map_or(0, |instr| instr.price_precision());
 
     // Get quantity
-    let quantity = if let Some(order) = order {
-        Quantity::new(order.total_quantity, size_precision)
-    } else {
-        Quantity::zero(size_precision)
-    };
+    let quantity = Quantity::new(order.total_quantity, size_precision);
 
     // Get filled quantity
     let filled_qty = Quantity::new(order_status.filled, size_precision);
@@ -219,33 +235,23 @@ pub fn parse_order_status_to_report(
     };
 
     if order_status.filled > 0.0
-        && (order_status.remaining > 0.0
-            || order.is_some_and(|order| order.total_quantity > order_status.filled))
+        && (order_status.remaining > 0.0 || order.total_quantity > order_status.filled)
     {
         nautilus_status = NautilusOrderStatus::PartiallyFilled;
     }
 
     let venue_order_id = ib_venue_order_id(order_status.order_id, order_status.perm_id);
 
-    let client_order_id = order
-        .and_then(|order| normalized_order_ref(&order.order_ref))
-        .map(ClientOrderId::new);
+    let client_order_id = normalized_order_ref(&order.order_ref).map(ClientOrderId::new);
 
-    // Map order type from IB order if available
-    let order_type = order
-        .map(|order| map_ib_order_type(&order.order_type, order.limit_price))
-        .unwrap_or(OrderType::Market);
-
-    // Map time in force from IB order if available
-    let time_in_force = if let Some(order) = order {
+    // Map time in force from the IB order
+    let time_in_force = {
         let ib_time_in_force = IbTimeInForce::from(order.tif.clone());
         if ib_time_in_force == IbTimeInForce::GoodTilDate || !order.good_till_date.is_empty() {
             TimeInForce::Gtd
         } else {
             ib_time_in_force.nautilus_time_in_force()
         }
-    } else {
-        TimeInForce::Day // Default when order not available
     };
 
     // Parse limit price if available
@@ -267,34 +273,36 @@ pub fn parse_order_status_to_report(
     );
 
     // Preserve the exact raw broker provenance alongside the normalized
-    // status; C2.4 adjudicates whether that provenance is trusted.
+    // status and type; C2.4 adjudicates whether that provenance is trusted
+    // (C2.6) and CWR-01B keeps the exact order-type identity visible.
     report = report.with_raw_order_status(raw_order_status);
+    report = report.with_raw_order_type(raw_order_type);
 
-    // Set optional fields
-    if let Some(order) = order {
-        if let Some(limit_price) = order.limit_price {
-            let converted = limit_price * price_magnifier;
-            report = report.with_price(Price::new(converted, price_precision));
-        }
+    // Set optional fields. Only broker-reported prices that carry a real value
+    // are attached: an IBKR price field of zero, negative, NaN or infinity is
+    // an unset sentinel, not price state (CWR-01B O1).
+    if let Some(price) = usable_ib_order_price(order.limit_price, price_magnifier, price_precision)
+    {
+        report = report.with_price(price);
+    }
 
-        let (trigger_price, limit_offset, trailing_offset, trailing_offset_type) =
-            parse_ib_order_pricing_fields(order, order_type, price_magnifier, price_precision)?;
+    let (trigger_price, limit_offset, trailing_offset, trailing_offset_type) =
+        parse_ib_order_pricing_fields(order, order_type, price_magnifier, price_precision)?;
 
-        if let Some(trigger_price) = trigger_price {
-            report = report.with_trigger_price(trigger_price);
-        }
+    if let Some(trigger_price) = trigger_price {
+        report = report.with_trigger_price(trigger_price);
+    }
 
-        if let Some(limit_offset) = limit_offset {
-            report = report.with_limit_offset(limit_offset);
-        }
+    if let Some(limit_offset) = limit_offset {
+        report = report.with_limit_offset(limit_offset);
+    }
 
-        if let Some(trailing_offset) = trailing_offset {
-            report = report.with_trailing_offset(trailing_offset);
-        }
+    if let Some(trailing_offset) = trailing_offset {
+        report = report.with_trailing_offset(trailing_offset);
+    }
 
-        if let Some(trailing_offset_type) = trailing_offset_type {
-            report = report.with_trailing_offset_type(trailing_offset_type);
-        }
+    if let Some(trailing_offset_type) = trailing_offset_type {
+        report = report.with_trailing_offset_type(trailing_offset_type);
     }
 
     if include_avg_px {
@@ -642,15 +650,12 @@ pub fn merge_order_status_reports(
         .collect()
 }
 
-fn map_ib_order_type(order_type: &str, limit_price: Option<f64>) -> OrderType {
-    if order_type == "IBALGO" && limit_price.is_some_and(|price| price != 0.0) {
-        OrderType::Limit
-    } else {
-        IbOrderType::from_str(order_type)
-            .map_or(OrderType::Market, IbOrderType::nautilus_order_type)
-    }
-}
-
+/// Parses the IBKR pricing fields that apply to `order_type`.
+///
+/// Prices are attached only when the broker reported a usable value
+/// ([`usable_ib_order_price`]); IBKR's zero/negative/non-finite sentinels must
+/// never reach a report as price state (CWR-01B O1). The trailing offsets are
+/// offsets rather than prices and keep their existing conversion.
 fn parse_ib_order_pricing_fields(
     order: &ibapi::orders::Order,
     order_type: OrderType,
@@ -662,7 +667,6 @@ fn parse_ib_order_pricing_fields(
     Option<Decimal>,
     Option<TrailingOffsetType>,
 )> {
-    let mut trigger_price = None;
     let mut limit_offset = None;
     let mut trailing_offset = None;
     let mut trailing_offset_type = None;
@@ -671,12 +675,8 @@ fn parse_ib_order_pricing_fields(
         order_type,
         OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
     ) {
-        if let Some(trail_stop_price) = order.trail_stop_price {
-            trigger_price = Some(Price::new(
-                trail_stop_price * price_magnifier,
-                price_precision,
-            ));
-        }
+        let trigger_price =
+            usable_ib_order_price(order.trail_stop_price, price_magnifier, price_precision);
 
         if let Some(aux_price) = order.aux_price {
             trailing_offset = Some(decimal_from_f64(aux_price)?);
@@ -701,12 +701,8 @@ fn parse_ib_order_pricing_fields(
         ));
     }
 
-    if let Some(aux_price) = order.aux_price {
-        trigger_price = Some(Price::new(aux_price * price_magnifier, price_precision));
-    }
-
     Ok((
-        trigger_price,
+        usable_ib_order_price(order.aux_price, price_magnifier, price_precision),
         limit_offset,
         trailing_offset,
         trailing_offset_type,
@@ -817,7 +813,7 @@ mod tests {
         orders::{Action, ExecutionSide, Liquidity, Order, OrderStatusKind},
     };
     use nautilus_model::{
-        enums::TrailingOffsetType,
+        enums::{OrderSide, TrailingOffsetType},
         identifiers::{Symbol, Venue},
         instruments::{InstrumentAny, stubs::equity_aapl},
     };
@@ -825,7 +821,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::InteractiveBrokersInstrumentProviderConfig,
+        common::enums::IbOrderTypeClass, config::InteractiveBrokersInstrumentProviderConfig,
         providers::instruments::InteractiveBrokersInstrumentProvider,
     };
 
@@ -840,9 +836,147 @@ mod tests {
 
     use rstest::rstest;
 
+    /// A minimal, fully offline `Order` fixture for the order-type fidelity
+    /// contract (CWR-01B). `parse_order_status_to_report` requires an order
+    /// object: without one there is no evidence for the order type, side or
+    /// quantity, and the parser refuses rather than fabricating them.
+    fn order_fixture(order_type: &str, limit_price: Option<f64>) -> Order {
+        Order {
+            action: Action::Buy,
+            total_quantity: 100.0,
+            order_type: order_type.to_string(),
+            limit_price,
+            ..Default::default()
+        }
+    }
+
+    /// Every IBKR wire type whose canonical Nautilus mapping is exact.
+    const EXACT_WIRE_TYPES: [&str; 9] = [
+        "MKT",
+        "LMT",
+        "STP",
+        "STP LMT",
+        "TRAIL",
+        "TRAIL LIMIT",
+        "MIT",
+        "LIT",
+        "MTL",
+    ];
+
+    /// IBKR wire types whose canonical mapping is truthful but attribute-lossy.
+    const PARTIAL_WIRE_TYPES: [&str; 4] = ["MOC", "LOC", "MKT PRT", "STP PRT"];
+
+    /// Recognized IBKR wire types with no truthful canonical counterpart.
+    const UNSUPPORTED_WIRE_TYPES: [&str; 12] = [
+        "MIDPRICE",
+        "PEG MKT",
+        "PEG STK",
+        "PEG MID",
+        "PEG BENCH",
+        "PEG BEST",
+        "REL",
+        "PASSV REL",
+        "VOL",
+        "BOX TOP",
+        "REL + LMT",
+        "REL + MKT",
+    ];
+
     #[rstest]
-    fn test_ibalgo_with_zero_limit_price_maps_to_market() {
-        assert_eq!(map_ib_order_type("IBALGO", Some(0.0)), OrderType::Market);
+    #[case("IBALGO", Some(185.0), OrderType::Limit)]
+    #[case("LMT", Some(185.0), OrderType::Limit)]
+    #[case("STP LMT", Some(179.0), OrderType::StopLimit)]
+    fn test_classify_known_wire_types_keep_their_canonical_mapping(
+        #[case] wire: &str,
+        #[case] limit_price: Option<f64>,
+        #[case] expected: OrderType,
+    ) {
+        let class = classify_ib_order_type(wire, limit_price);
+
+        assert_eq!(class.canonical(), Some(expected));
+        assert!(class.canonical().is_some(), "{wire} must stay publishable");
+    }
+
+    #[rstest]
+    #[case("IBALGO", None)]
+    #[case("IBALGO", Some(0.0))]
+    #[case("IBALGO", Some(-1.0))]
+    fn test_classify_ibalgo_without_usable_limit_price_is_unsupported(
+        #[case] wire: &str,
+        #[case] limit_price: Option<f64>,
+    ) {
+        // D1: the Adaptive-algo marker carries no base order type, and without a
+        // usable limit price there is no evidence for one. It must not become
+        // Market (t1 §5; the previous behaviour).
+        let class = classify_ib_order_type(wire, limit_price);
+
+        assert_eq!(class, IbOrderTypeClass::Unsupported);
+        assert_eq!(class.canonical(), None);
+        assert!(class.canonical().is_none());
+    }
+
+    #[rstest]
+    fn test_classify_unknown_wire_types_are_not_canonical() {
+        for wire in [
+            "XYZ",
+            "AUCTIONLIMIT",
+            "COMBOMARKET",
+            "PEG FIX",
+            "peg mid",
+            "MKT ",
+        ] {
+            let class = classify_ib_order_type(wire, Some(185.0));
+
+            assert_eq!(class, IbOrderTypeClass::Unknown, "{wire}");
+            assert_eq!(class.canonical(), None, "{wire}");
+            assert!(class.canonical().is_none(), "{wire}");
+        }
+    }
+
+    #[rstest]
+    fn test_classify_malformed_wire_types_are_distinguishable() {
+        for wire in ["", "   ", "\t"] {
+            let class = classify_ib_order_type(wire, Some(185.0));
+
+            assert_eq!(class, IbOrderTypeClass::Malformed, "{wire:?}");
+            assert_eq!(class.canonical(), None, "{wire:?}");
+            assert_ne!(
+                class,
+                classify_ib_order_type("XYZ", Some(185.0)),
+                "malformed must stay distinguishable from unknown",
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_classify_recognized_types_are_explicitly_classified() {
+        for wire in EXACT_WIRE_TYPES {
+            let class = classify_ib_order_type(wire, None);
+
+            assert!(
+                matches!(class, IbOrderTypeClass::Exact(_)),
+                "{wire} must be an exact projection, was {class:?}",
+            );
+        }
+
+        for wire in PARTIAL_WIRE_TYPES {
+            let class = classify_ib_order_type(wire, None);
+
+            assert!(
+                matches!(class, IbOrderTypeClass::Partial(_)),
+                "{wire} must be a truthful but attribute-lossy projection, was {class:?}",
+            );
+        }
+
+        for wire in UNSUPPORTED_WIRE_TYPES {
+            let class = classify_ib_order_type(wire, None);
+
+            assert_eq!(
+                class,
+                IbOrderTypeClass::Unsupported,
+                "{wire} has no truthful canonical counterpart",
+            );
+        }
     }
 
     #[rstest]
@@ -975,24 +1109,21 @@ mod tests {
             market_cap_price: Some(0.0),
         };
 
-        let result = parse_order_status_to_report(
+        let order = order_fixture("MKT", None);
+
+        let report = parse_order_status_to_report(
             &order_status,
-            None,
+            Some(&order),
             instrument_id,
             account_id,
             &instrument_provider,
             UnixNanos::new(0),
-        );
+        )
+        .unwrap();
 
-        // May fail if instrument not in provider, but that's expected
-        if let Err(e) = result {
-            let error_msg = e.to_string();
-            assert!(
-                error_msg.contains("not found") || error_msg.contains("instrument"),
-                "Unexpected error: {}",
-                error_msg
-            );
-        }
+        assert_eq!(report.order_status, NautilusOrderStatus::Accepted);
+        assert_eq!(report.raw_order_status.as_deref(), Some("Submitted"));
+        assert_eq!(report.raw_order_type.as_deref(), Some("MKT"));
     }
 
     #[rstest]
@@ -1015,24 +1146,20 @@ mod tests {
             market_cap_price: Some(0.0),
         };
 
-        let result = parse_order_status_to_report(
+        let order = order_fixture("MKT", None);
+
+        let report = parse_order_status_to_report(
             &order_status,
-            None,
+            Some(&order),
             instrument_id,
             account_id,
             &instrument_provider,
             UnixNanos::new(0),
-        );
+        )
+        .unwrap();
 
-        // May fail if instrument not in provider, but that's expected
-        if let Err(e) = result {
-            let error_msg = e.to_string();
-            assert!(
-                error_msg.contains("not found") || error_msg.contains("instrument"),
-                "Unexpected error: {}",
-                error_msg
-            );
-        }
+        assert_eq!(report.order_status, NautilusOrderStatus::Filled);
+        assert_eq!(report.filled_qty, Quantity::new(100.0, 0));
     }
 
     #[rstest]
@@ -1058,9 +1185,11 @@ mod tests {
             market_cap_price: Some(0.0),
         };
 
+        let order = order_fixture("MKT", None);
+
         let report = parse_order_status_to_report(
             &order_status,
-            None,
+            Some(&order),
             instrument_id,
             account_id,
             &instrument_provider,
@@ -1091,9 +1220,11 @@ mod tests {
             market_cap_price: Some(0.0),
         };
 
+        let order = order_fixture("MKT", None);
+
         let report = parse_order_status_to_report(
             &order_status,
-            None,
+            Some(&order),
             instrument_id,
             account_id,
             &instrument_provider,
@@ -1126,9 +1257,11 @@ mod tests {
             market_cap_price: Some(0.0),
         };
 
+        let order = order_fixture("MKT", None);
+
         let report = parse_order_status_to_report(
             &order_status,
-            None,
+            Some(&order),
             instrument_id,
             account_id,
             &instrument_provider,
@@ -1166,9 +1299,11 @@ mod tests {
             market_cap_price: Some(0.0),
         };
 
+        let order = order_fixture("MKT", None);
+
         let report = parse_order_status_to_report(
             &order_status,
-            None,
+            Some(&order),
             instrument_id,
             account_id,
             &instrument_provider,
@@ -1225,6 +1360,329 @@ mod tests {
         );
     }
 
+    /// CWR-01B R1/R5: an inbound wire type with no truthful canonical mapping
+    /// is refused, and the exact raw wire identifier is named in the error
+    /// context so the outcome stays observable.
+    #[rstest]
+    #[case("XYZ", Some(185.0), "unknown")]
+    #[case("AUCTIONLIMIT", Some(185.0), "unknown")]
+    #[case("COMBOMARKET", Some(185.0), "unknown")]
+    #[case("PEG FIX", Some(185.0), "unknown")]
+    #[case("peg mid", Some(185.0), "unknown")]
+    #[case("IBALGO", None, "unsupported")]
+    #[case("IBALGO", Some(0.0), "unsupported")]
+    #[case("MIDPRICE", Some(185.0), "unsupported")]
+    #[case("PEG MKT", Some(185.0), "unsupported")]
+    #[case("PEG STK", Some(185.0), "unsupported")]
+    #[case("PEG MID", Some(185.0), "unsupported")]
+    #[case("PEG BENCH", Some(185.0), "unsupported")]
+    #[case("PEG BEST", Some(185.0), "unsupported")]
+    #[case("REL", Some(185.0), "unsupported")]
+    #[case("PASSV REL", Some(185.0), "unsupported")]
+    #[case("VOL", Some(185.0), "unsupported")]
+    #[case("BOX TOP", Some(185.0), "unsupported")]
+    #[case("REL + LMT", Some(185.0), "unsupported")]
+    #[case("REL + MKT", Some(185.0), "unsupported")]
+    #[case("", Some(185.0), "malformed")]
+    #[case("   ", Some(185.0), "malformed")]
+    fn test_parse_order_status_to_report_refuses_unclassified_types(
+        #[case] wire: &str,
+        #[case] limit_price: Option<f64>,
+        #[case] expected_class: &str,
+    ) {
+        let instrument_provider = create_test_instrument_provider();
+        let order_status = OrderStatus {
+            order_id: 12345,
+            status: OrderStatusKind::Submitted,
+            filled: 0.0,
+            remaining: 5.0,
+            average_fill_price: Some(0.0),
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: Some(0.0),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+        let order = order_fixture(wire, limit_price);
+
+        let error = parse_order_status_to_report(
+            &order_status,
+            Some(&order),
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .expect_err("an unclassifiable order type must never produce a report");
+
+        let message = error.to_string();
+
+        assert!(
+            message.contains(expected_class),
+            "error must name the class {expected_class:?}, was: {message}",
+        );
+        assert!(
+            message.contains(&format!("{wire:?}")),
+            "error must preserve the raw wire identifier {wire:?}, was: {message}",
+        );
+    }
+
+    /// CWR-01B R1/R2: every published report carries the exact wire identifier
+    /// byte-for-byte, and the canonical mapping stays what it always was for
+    /// the types it already supported.
+    #[rstest]
+    #[case("MKT", OrderType::Market)]
+    #[case("MOC", OrderType::Market)]
+    #[case("LMT", OrderType::Limit)]
+    #[case("LOC", OrderType::Limit)]
+    #[case("STP", OrderType::StopMarket)]
+    #[case("STP LMT", OrderType::StopLimit)]
+    #[case("TRAIL", OrderType::TrailingStopMarket)]
+    #[case("TRAIL LIMIT", OrderType::TrailingStopLimit)]
+    #[case("MIT", OrderType::MarketIfTouched)]
+    #[case("LIT", OrderType::LimitIfTouched)]
+    #[case("MTL", OrderType::MarketToLimit)]
+    #[case("MKT PRT", OrderType::Market)]
+    #[case("STP PRT", OrderType::StopMarket)]
+    #[case("IBALGO", OrderType::Limit)]
+    fn test_parse_order_status_to_report_preserves_raw_wire_type(
+        #[case] wire: &str,
+        #[case] expected_order_type: OrderType,
+    ) {
+        let instrument_provider = create_test_instrument_provider();
+        let order_status = OrderStatus {
+            order_id: 12345,
+            status: OrderStatusKind::Submitted,
+            filled: 0.0,
+            remaining: 5.0,
+            average_fill_price: Some(0.0),
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: Some(0.0),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+        let order = order_fixture(wire, Some(185.0));
+
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&order),
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, expected_order_type);
+        assert_eq!(
+            report.raw_order_type.as_deref(),
+            Some(wire),
+            "the raw wire identifier must survive byte-for-byte",
+        );
+        // Quantity preservation: the report carries the broker-reported total.
+        assert_eq!(report.quantity, Quantity::new(100.0, 0));
+    }
+
+    /// CWR-01B O1: a price field that does not carry a real price (IBKR's zero
+    /// sentinel, or a negative/NaN/infinite value) must never be attached as
+    /// broker price state on either the report or the order-update path.
+    #[rstest]
+    #[case("MKT")]
+    #[case("MOC")]
+    #[case("LMT")]
+    #[case("LOC")]
+    #[case("MTL")]
+    #[case("STP")]
+    #[case("STP LMT")]
+    #[case("MIT")]
+    #[case("LIT")]
+    #[case("MKT PRT")]
+    #[case("STP PRT")]
+    fn test_parse_order_status_to_report_does_not_attach_unusable_prices(#[case] wire: &str) {
+        let instrument_provider = create_test_instrument_provider();
+
+        for unusable in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let order_status = OrderStatus {
+                order_id: 12345,
+                status: OrderStatusKind::Submitted,
+                filled: 0.0,
+                remaining: 5.0,
+                average_fill_price: Some(0.0),
+                perm_id: 0,
+                parent_id: 0,
+                last_fill_price: Some(0.0),
+                client_id: 0,
+                why_held: String::new(),
+                market_cap_price: Some(0.0),
+            };
+            let order = Order {
+                action: Action::Buy,
+                total_quantity: 5.0,
+                order_type: wire.to_string(),
+                limit_price: Some(unusable),
+                aux_price: Some(unusable),
+                ..Default::default()
+            };
+
+            let report = parse_order_status_to_report(
+                &order_status,
+                Some(&order),
+                create_test_instrument_id(),
+                AccountId::from("IB-001"),
+                &instrument_provider,
+                UnixNanos::new(0),
+            )
+            .unwrap();
+
+            assert!(
+                report.price.is_none(),
+                "{wire} must not attach limit_price={unusable}",
+            );
+            assert!(
+                report.trigger_price.is_none(),
+                "{wire} must not attach aux_price={unusable}",
+            );
+        }
+    }
+
+    /// CWR-01B O1 non-regression: a real stop or trail price still attaches.
+    #[rstest]
+    fn test_parse_order_status_to_report_keeps_real_stop_and_trail_prices() {
+        let instrument_provider = create_test_instrument_provider();
+
+        let order_status = OrderStatus {
+            order_id: 12345,
+            status: OrderStatusKind::Submitted,
+            filled: 0.0,
+            remaining: 5.0,
+            average_fill_price: Some(0.0),
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: Some(0.0),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+
+        let stop = Order {
+            action: Action::Buy,
+            total_quantity: 5.0,
+            order_type: "STP".to_string(),
+            aux_price: Some(180.0),
+            ..Default::default()
+        };
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&stop),
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+        assert_eq!(report.trigger_price, Some(Price::new(180.0, 0)));
+
+        let stop_limit = Order {
+            action: Action::Buy,
+            total_quantity: 5.0,
+            order_type: "STP LMT".to_string(),
+            limit_price: Some(179.0),
+            aux_price: Some(180.0),
+            ..Default::default()
+        };
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&stop_limit),
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+        assert_eq!(report.price, Some(Price::new(179.0, 0)));
+        assert_eq!(report.trigger_price, Some(Price::new(180.0, 0)));
+
+        let trailing = Order {
+            action: Action::Buy,
+            total_quantity: 5.0,
+            order_type: "TRAIL".to_string(),
+            trail_stop_price: Some(185.0),
+            ..Default::default()
+        };
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&trailing),
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+        assert_eq!(report.trigger_price, Some(Price::new(185.0, 0)));
+
+        let trailing_limit = Order {
+            action: Action::Buy,
+            total_quantity: 5.0,
+            order_type: "TRAIL LIMIT".to_string(),
+            trail_stop_price: Some(185.0),
+            limit_price_offset: Some(0.25),
+            ..Default::default()
+        };
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&trailing_limit),
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+        assert_eq!(report.trigger_price, Some(Price::new(185.0, 0)));
+        assert_eq!(
+            report.limit_offset,
+            Some(Decimal::from_str("0.25").unwrap()),
+        );
+    }
+
+    /// CWR-01B S3: without an order object there is no evidence for the order
+    /// type, side or quantity, so the parser refuses instead of fabricating a
+    /// market order.
+    #[rstest]
+    fn test_parse_order_status_to_report_refuses_absent_order_object() {
+        let instrument_provider = create_test_instrument_provider();
+        let order_status = OrderStatus {
+            order_id: 12345,
+            status: OrderStatusKind::Submitted,
+            filled: 0.0,
+            remaining: 5.0,
+            average_fill_price: Some(0.0),
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: Some(0.0),
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: Some(0.0),
+        };
+
+        let error = parse_order_status_to_report(
+            &order_status,
+            None,
+            create_test_instrument_id(),
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .expect_err("an absent order object must never produce a report");
+
+        assert!(
+            error.to_string().contains("no order object"),
+            "error must say what evidence is missing, was: {error}",
+        );
+    }
+
     #[rstest]
     fn test_ib_venue_order_id_prefers_perm_id_and_falls_back_to_order_id() {
         assert_eq!(ib_venue_order_id(123, 456).to_string(), "PERM-456");
@@ -1278,19 +1736,11 @@ mod tests {
         None,
         None
     )]
-    #[case(
-        "IBALGO",
-        None,
-        None,
-        None,
-        None,
-        OrderType::Market,
-        None,
-        None,
-        None,
-        None,
-        None
-    )]
+    // The former `IBALGO` + absent limit price case asserted `OrderType::Market`.
+    // That behaviour is the defect CWR-01B removes: the wire type is now
+    // classified unsupported and refused
+    // (`test_classify_ibalgo_without_usable_limit_price_is_unsupported` and
+    // `test_parse_order_status_to_report_refuses_unclassified_types`).
     #[case(
         "MIT",
         None,

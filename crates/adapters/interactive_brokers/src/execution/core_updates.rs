@@ -11,7 +11,10 @@ use ibapi::subscriptions::SubscriptionItem;
 
 use super::*;
 use crate::{
-    common::enums::{IbAction, IbOrderStatus, IbOrderType},
+    common::{
+        enums::{IbAction, IbOrderStatus, classify_ib_order_type},
+        parse::usable_ib_order_price,
+    },
     execution::parse,
 };
 
@@ -429,29 +432,47 @@ impl InteractiveBrokersExecutionClient {
             .map_err(|e| anyhow::anyhow!("Failed to send order updated event: {e}"))
     }
 
+    /// Returns the `(price, trigger_price)` shape for an `OrderUpdated` event.
+    ///
+    /// For a wire type with a truthful canonical mapping, the shape is selected
+    /// by type exactly as before. For a wire type with no canonical mapping the
+    /// function must not claim one (CWR-01B D1 identical-rule requirement):
+    /// it carries only the prices IBKR actually reported, guarded by the same
+    /// usable-price predicate as the report path, and logs the wire type so the
+    /// unsupported observation stays visible.
     fn open_order_price_fields(
         order_data: &ibapi::orders::OrderData,
         price_magnifier: f64,
         price_precision: u8,
     ) -> (Option<Price>, Option<Price>) {
-        let order_type = IbOrderType::from_str(order_data.order.order_type.as_str())
-            .map_or(OrderType::Market, IbOrderType::nautilus_order_type);
-        let price = order_data
-            .order
-            .limit_price
-            .map(|price| Price::new(price * price_magnifier, price_precision));
-        let trigger_price = order_data
-            .order
-            .aux_price
-            .map(|price| Price::new(price * price_magnifier, price_precision));
+        let wire_order_type = order_data.order.order_type.as_str();
+        let order_type_class =
+            classify_ib_order_type(wire_order_type, order_data.order.limit_price);
+        let price = usable_ib_order_price(
+            order_data.order.limit_price,
+            price_magnifier,
+            price_precision,
+        );
+        let trigger_price =
+            usable_ib_order_price(order_data.order.aux_price, price_magnifier, price_precision);
 
-        match order_type {
-            OrderType::Market | OrderType::MarketToLimit | OrderType::TrailingStopMarket => {
+        match order_type_class.canonical() {
+            Some(OrderType::Market | OrderType::MarketToLimit | OrderType::TrailingStopMarket) => {
                 (None, None)
             }
-            OrderType::Limit | OrderType::TrailingStopLimit => (price, None),
-            OrderType::StopMarket | OrderType::MarketIfTouched => (None, trigger_price),
-            OrderType::StopLimit | OrderType::LimitIfTouched => (price, trigger_price),
+            Some(OrderType::Limit | OrderType::TrailingStopLimit) => (price, None),
+            Some(OrderType::StopMarket | OrderType::MarketIfTouched) => (None, trigger_price),
+            Some(OrderType::StopLimit | OrderType::LimitIfTouched) => (price, trigger_price),
+            None => {
+                tracing::debug!(
+                    order_id = order_data.order_id,
+                    order_type = wire_order_type,
+                    order_type_class = order_type_class.as_str(),
+                    "IBKR open order has no canonical Nautilus order type; carrying only the broker-reported prices",
+                );
+
+                (price, trigger_price)
+            }
         }
     }
 
@@ -1428,5 +1449,105 @@ impl InteractiveBrokersExecutionClient {
             Err(provider_error) => Err(provider_error)
                 .context("Failed to resolve BAG contract to spread instrument ID"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ibapi::orders::{Action, Order, OrderData};
+    use nautilus_model::types::Price;
+    use rstest::rstest;
+
+    use super::*;
+
+    fn open_order(order_type: &str, limit_price: Option<f64>, aux_price: Option<f64>) -> OrderData {
+        OrderData {
+            order_id: 7,
+            order: Order {
+                action: Action::Buy,
+                total_quantity: 1.0,
+                order_type: order_type.to_string(),
+                limit_price,
+                aux_price,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// CWR-01B R2/D1: the open-order update path keeps the same type-scoped
+    /// price shape for every wire type with a truthful canonical mapping, and
+    /// now agrees with the report path for `IBALGO` + a usable limit price.
+    #[rstest]
+    #[case("MKT", None, None, (None, None))]
+    #[case("LMT", Some(185.0), None, (Some(Price::new(185.0, 2)), None))]
+    #[case("IBALGO", Some(185.0), None, (Some(Price::new(185.0, 2)), None))]
+    #[case("STP", None, Some(180.0), (None, Some(Price::new(180.0, 2))))]
+    #[case(
+        "STP LMT",
+        Some(179.0),
+        Some(180.0),
+        (Some(Price::new(179.0, 2)), Some(Price::new(180.0, 2)))
+    )]
+    #[case("MKT PRT", Some(185.0), None, (None, None))]
+    #[case("TRAIL", Some(185.0), None, (None, None))]
+    fn test_open_order_price_fields_keeps_type_scoped_shape(
+        #[case] wire: &str,
+        #[case] limit_price: Option<f64>,
+        #[case] aux_price: Option<f64>,
+        #[case] expected: (Option<Price>, Option<Price>),
+    ) {
+        let fields = InteractiveBrokersExecutionClient::open_order_price_fields(
+            &open_order(wire, limit_price, aux_price),
+            1.0,
+            2,
+        );
+
+        assert_eq!(fields, expected, "{wire}");
+    }
+
+    /// CWR-01B D1/D3: a wire type with no canonical mapping must not claim a
+    /// market-order shape; it carries only the broker-reported usable prices.
+    #[rstest]
+    #[case("PEG MID", Some(185.0), Some(180.0), (Some(Price::new(185.0, 2)), Some(Price::new(180.0, 2))))]
+    #[case("XYZ", None, Some(180.0), (None, Some(Price::new(180.0, 2))))]
+    #[case("IBALGO", None, None, (None, None))]
+    #[case("", Some(185.0), None, (Some(Price::new(185.0, 2)), None))]
+    fn test_open_order_price_fields_does_not_fabricate_a_shape(
+        #[case] wire: &str,
+        #[case] limit_price: Option<f64>,
+        #[case] aux_price: Option<f64>,
+        #[case] expected: (Option<Price>, Option<Price>),
+    ) {
+        let fields = InteractiveBrokersExecutionClient::open_order_price_fields(
+            &open_order(wire, limit_price, aux_price),
+            1.0,
+            2,
+        );
+
+        assert_eq!(fields, expected, "{wire}");
+    }
+
+    /// CWR-01B O1/O1b-2: the derivation itself must drop IBKR price sentinels
+    /// before the type-scoped selection ever sees them.
+    #[rstest]
+    #[case("LMT", 0.0)]
+    #[case("LMT", -1.0)]
+    #[case("LMT", f64::NAN)]
+    #[case("LMT", f64::INFINITY)]
+    #[case("STP LMT", 0.0)]
+    #[case("STP", -5.0)]
+    #[case("PEG MID", 0.0)]
+    fn test_open_order_price_fields_drops_unusable_prices(
+        #[case] wire: &str,
+        #[case] unusable: f64,
+    ) {
+        let fields = InteractiveBrokersExecutionClient::open_order_price_fields(
+            &open_order(wire, Some(unusable), Some(unusable)),
+            1.0,
+            2,
+        );
+
+        assert_eq!(fields, (None, None), "{wire} with {unusable}");
     }
 }

@@ -76,6 +76,7 @@ impl OrderStatusReport {
         cancel_reason=None,
         ts_triggered=None,
         raw_order_status=None,
+        raw_order_type=None,
     ))]
     fn py_new(
         account_id: AccountId,
@@ -112,6 +113,7 @@ impl OrderStatusReport {
         cancel_reason: Option<String>,
         ts_triggered: Option<u64>,
         raw_order_status: Option<String>,
+        raw_order_type: Option<String>,
     ) -> Self {
         let mut report = Self::new(
             account_id,
@@ -208,6 +210,10 @@ impl OrderStatusReport {
 
         if let Some(raw_order_status) = raw_order_status {
             report = report.with_raw_order_status(raw_order_status);
+        }
+
+        if let Some(raw_order_type) = raw_order_type {
+            report = report.with_raw_order_type(raw_order_type);
         }
 
         report
@@ -434,6 +440,12 @@ impl OrderStatusReport {
     }
 
     #[getter]
+    #[pyo3(name = "raw_order_type")]
+    fn py_raw_order_type(&self) -> Option<String> {
+        self.raw_order_type.clone()
+    }
+
+    #[getter]
     #[pyo3(name = "is_open")]
     fn py_is_open(&self) -> bool {
         matches!(
@@ -585,6 +597,11 @@ impl OrderStatusReport {
         match &self.raw_order_status {
             Some(raw) => dict.set_item("raw_order_status", raw)?,
             None => dict.set_item("raw_order_status", py.None())?,
+        }
+
+        match &self.raw_order_type {
+            Some(raw) => dict.set_item("raw_order_type", raw)?,
+            None => dict.set_item("raw_order_type", py.None())?,
         }
 
         Ok(dict.into())

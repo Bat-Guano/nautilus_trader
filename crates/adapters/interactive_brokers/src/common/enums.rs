@@ -135,9 +135,92 @@ mod tests {
         assert_eq!(order_type, expected_order_type);
         assert_eq!(
             order_type.nautilus_order_type(),
-            expected_nautilus_order_type
+            Some(expected_nautilus_order_type)
         );
         assert_eq!(order_type.to_string(), value);
+    }
+
+    /// CWR-01B R2: the 13 recognized types with a truthful canonical mapping
+    /// keep it, and only the four attribute-lossy ones are marked inexact.
+    #[rstest]
+    #[case("MKT", IbOrderType::Market)]
+    #[case("LMT", IbOrderType::Limit)]
+    #[case("STP", IbOrderType::Stop)]
+    #[case("STP LMT", IbOrderType::StopLimit)]
+    #[case("TRAIL", IbOrderType::TrailingStop)]
+    #[case("TRAIL LIMIT", IbOrderType::TrailingStopLimit)]
+    #[case("MIT", IbOrderType::MarketIfTouched)]
+    #[case("LIT", IbOrderType::LimitIfTouched)]
+    #[case("MTL", IbOrderType::MarketToLimit)]
+    fn test_ib_order_type_exact_canonical_projection(
+        #[case] wire: &str,
+        #[case] expected: IbOrderType,
+    ) {
+        let order_type = IbOrderType::from_str(wire).unwrap();
+
+        assert_eq!(order_type, expected);
+        assert!(order_type.has_exact_canonical_projection(), "{wire}");
+        assert!(order_type.nautilus_order_type().is_some(), "{wire}");
+    }
+
+    #[rstest]
+    #[case("MOC", IbOrderType::MarketOnClose, NautilusOrderType::Market)]
+    #[case("LOC", IbOrderType::LimitOnClose, NautilusOrderType::Limit)]
+    #[case(
+        "MKT PRT",
+        IbOrderType::MarketWithProtection,
+        NautilusOrderType::Market
+    )]
+    #[case(
+        "STP PRT",
+        IbOrderType::StopWithProtection,
+        NautilusOrderType::StopMarket
+    )]
+    fn test_ib_order_type_attribute_lossy_projection(
+        #[case] wire: &str,
+        #[case] expected: IbOrderType,
+        #[case] expected_nautilus: NautilusOrderType,
+    ) {
+        let order_type = IbOrderType::from_str(wire).unwrap();
+
+        assert_eq!(order_type, expected);
+        assert!(!order_type.has_exact_canonical_projection(), "{wire}");
+        assert_eq!(order_type.nautilus_order_type(), Some(expected_nautilus));
+    }
+
+    /// CWR-01B: the recognized IBKR types whose semantics the Nautilus order
+    /// model cannot truthfully express must report *no* canonical type, so no
+    /// inbound path can substitute a fabricated one.
+    #[rstest]
+    #[case("MIDPRICE", IbOrderType::Midprice)]
+    #[case("PEG MKT", IbOrderType::PeggedToMarket)]
+    #[case("PEG STK", IbOrderType::PeggedToStock)]
+    #[case("PEG MID", IbOrderType::PeggedToMidpoint)]
+    #[case("PEG BENCH", IbOrderType::PeggedToBenchmark)]
+    #[case("PEG BEST", IbOrderType::PegBest)]
+    #[case("REL", IbOrderType::Relative)]
+    #[case("PASSV REL", IbOrderType::PassiveRelative)]
+    #[case("VOL", IbOrderType::Volatility)]
+    #[case("BOX TOP", IbOrderType::BoxTop)]
+    #[case("REL + LMT", IbOrderType::RelativeLimitCombo)]
+    #[case("REL + MKT", IbOrderType::RelativeMarketCombo)]
+    fn test_ib_order_type_without_truthful_canonical_counterpart(
+        #[case] wire: &str,
+        #[case] expected: IbOrderType,
+    ) {
+        let order_type = IbOrderType::from_str(wire).unwrap();
+
+        assert_eq!(order_type, expected);
+        assert_eq!(
+            order_type.nautilus_order_type(),
+            None,
+            "{wire} must not claim a canonical type",
+        );
+        assert_eq!(
+            classify_ib_order_type(wire, None),
+            IbOrderTypeClass::Unsupported,
+            "{wire}",
+        );
     }
 
     #[rstest]

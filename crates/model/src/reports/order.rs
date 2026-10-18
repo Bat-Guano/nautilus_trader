@@ -117,6 +117,18 @@ pub struct OrderStatusReport {
     /// preserved byte-for-byte; trust adjudication is the consumer's
     /// responsibility (C2.6).
     pub raw_order_status: Option<String>,
+    /// The raw broker order type string as received from the venue, when the
+    /// adapter preserves it (e.g. IBKR). `None` for adapters that do not
+    /// provide raw provenance, which is distinct from a venue that reported a
+    /// value: `Some(_)` preserves the exact wire string byte-for-byte,
+    /// including values outside the adapter's recognized vocabulary.
+    ///
+    /// [`Self::order_type`] remains the normalized Nautilus type and is only
+    /// set from a mapping the adapter can justify for the raw value; the raw
+    /// string is the authoritative identity for consumers that need to
+    /// distinguish an exact mapping, an attribute-lossy mapping, or a value the
+    /// adapter does not classify (CWR-01B).
+    pub raw_order_type: Option<String>,
 }
 
 impl OrderStatusReport {
@@ -174,6 +186,7 @@ impl OrderStatusReport {
             cancel_reason: None,
             ts_triggered: None,
             raw_order_status: None,
+            raw_order_type: None,
         }
     }
 
@@ -323,6 +336,13 @@ impl OrderStatusReport {
         self
     }
 
+    /// Sets the raw broker order type string.
+    #[must_use]
+    pub fn with_raw_order_type(mut self, raw_order_type: String) -> Self {
+        self.raw_order_type = Some(raw_order_type);
+        self
+    }
+
     /// Sets the contingency type.
     #[must_use]
     pub const fn with_contingency_type(mut self, contingency_type: ContingencyType) -> Self {
@@ -395,7 +415,8 @@ impl Display for OrderStatusReport {
                 reduce_only={}, \
                 cancel_reason={:?}, \
                 ts_triggered={:?}, \
-                raw_order_status={:?}\
+                raw_order_status={:?}, \
+                raw_order_type={:?}\
             )",
             self.account_id,
             self.instrument_id,
@@ -437,6 +458,7 @@ impl Display for OrderStatusReport {
             self.cancel_reason,
             self.ts_triggered,
             self.raw_order_status,
+            self.raw_order_type,
         )
     }
 }
@@ -520,6 +542,7 @@ mod tests {
         assert_eq!(report.cancel_reason, None);
         assert_eq!(report.ts_triggered, None);
         assert_eq!(report.raw_order_status, None);
+        assert_eq!(report.raw_order_type, None);
     }
 
     #[rstest]
@@ -530,6 +553,17 @@ mod tests {
         assert_eq!(
             report.raw_order_status.as_deref(),
             Some("SomeFutureIbkrStatus"),
+        );
+    }
+
+    #[rstest]
+    fn test_order_status_report_with_raw_order_type() {
+        let report = test_order_status_report().with_raw_order_type("PEG MID".to_string());
+
+        assert_eq!(report.raw_order_type.as_deref(), Some("PEG MID"));
+        assert!(
+            report.to_string().contains("PEG MID"),
+            "the raw order type must be observable in the report display",
         );
     }
 

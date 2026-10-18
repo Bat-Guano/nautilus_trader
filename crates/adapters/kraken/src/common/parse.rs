@@ -777,6 +777,7 @@ pub fn parse_order_status_report(
         cancel_reason: order.reason.clone(),
         ts_triggered: None,
         raw_order_status: None,
+        raw_order_type: None,
     })
 }
 
@@ -951,6 +952,7 @@ pub fn parse_futures_order_status_report(
         cancel_reason: None,
         ts_triggered: None,
         raw_order_status: None,
+        raw_order_type: None,
     })
 }
 
@@ -1033,6 +1035,7 @@ pub fn parse_futures_order_event_status_report(
         cancel_reason: None,
         ts_triggered: None,
         raw_order_status: None,
+        raw_order_type: None,
     })
 }
 

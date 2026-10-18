@@ -328,21 +328,37 @@ impl IbOrderType {
         }
     }
 
-    /// Converts the IB order type to a Nautilus order type.
+    /// Converts the IB order type to a Nautilus order type, when a truthful
+    /// canonical mapping exists.
+    ///
+    /// Returns `None` for the recognized IBKR order types whose semantics the
+    /// Nautilus order model cannot truthfully express: `Midprice`, the pegged
+    /// family, `Relative`, `PassiveRelative`, `Volatility`, `BoxTop`,
+    /// `RelativeLimitCombo` and `RelativeMarketCombo`. A passive midpoint or
+    /// pegged order is not an aggressive market order, so claiming `Market`
+    /// would assert something untrue rather than merely incomplete. Callers
+    /// must fail closed for `None` instead of substituting a canonical type.
+    ///
+    /// The recognized types whose projection is truthful but attribute-lossy
+    /// (`MarketOnClose`, `LimitOnClose`, `MarketWithProtection`,
+    /// `StopWithProtection`) still return `Some`: the core order genuinely is a
+    /// market or stop order, only the IBKR-specific attribute is absent; see
+    /// [`Self::has_exact_canonical_projection`].
     #[must_use]
-    pub const fn nautilus_order_type(self) -> NautilusOrderType {
+    pub const fn nautilus_order_type(self) -> Option<NautilusOrderType> {
         match self {
-            Self::Market | Self::MarketOnClose => NautilusOrderType::Market,
-            Self::Limit | Self::LimitOnClose => NautilusOrderType::Limit,
-            Self::Stop => NautilusOrderType::StopMarket,
-            Self::StopLimit => NautilusOrderType::StopLimit,
-            Self::TrailingStop => NautilusOrderType::TrailingStopMarket,
-            Self::TrailingStopLimit => NautilusOrderType::TrailingStopLimit,
-            Self::MarketIfTouched => NautilusOrderType::MarketIfTouched,
-            Self::LimitIfTouched => NautilusOrderType::LimitIfTouched,
-            Self::MarketToLimit => NautilusOrderType::MarketToLimit,
-            Self::MarketWithProtection
-            | Self::Midprice
+            Self::Market | Self::MarketOnClose => Some(NautilusOrderType::Market),
+            Self::Limit | Self::LimitOnClose => Some(NautilusOrderType::Limit),
+            Self::Stop => Some(NautilusOrderType::StopMarket),
+            Self::StopLimit => Some(NautilusOrderType::StopLimit),
+            Self::TrailingStop => Some(NautilusOrderType::TrailingStopMarket),
+            Self::TrailingStopLimit => Some(NautilusOrderType::TrailingStopLimit),
+            Self::MarketIfTouched => Some(NautilusOrderType::MarketIfTouched),
+            Self::LimitIfTouched => Some(NautilusOrderType::LimitIfTouched),
+            Self::MarketToLimit => Some(NautilusOrderType::MarketToLimit),
+            Self::MarketWithProtection => Some(NautilusOrderType::Market),
+            Self::StopWithProtection => Some(NautilusOrderType::StopMarket),
+            Self::Midprice
             | Self::PeggedToMarket
             | Self::PeggedToStock
             | Self::PeggedToMidpoint
@@ -352,10 +368,28 @@ impl IbOrderType {
             | Self::PassiveRelative
             | Self::Volatility
             | Self::BoxTop
-            | Self::RelativeMarketCombo => NautilusOrderType::Market,
-            Self::RelativeLimitCombo => NautilusOrderType::Limit,
-            Self::StopWithProtection => NautilusOrderType::StopMarket,
+            | Self::RelativeLimitCombo
+            | Self::RelativeMarketCombo => None,
         }
+    }
+
+    /// Returns whether [`Self::nautilus_order_type`] is an *exact* projection.
+    ///
+    /// Returns `false` for the recognized IBKR types whose canonical Nautilus
+    /// type is truthful but loses an IBKR-specific attribute: `MOC` and `LOC`
+    /// (close-only execution), `MKT PRT` (price protection) and `STP PRT`
+    /// (protection). Those attributes are not reconstructed on the inbound
+    /// path, so the raw wire identifier must be preserved alongside the
+    /// canonical value.
+    #[must_use]
+    pub const fn has_exact_canonical_projection(self) -> bool {
+        !matches!(
+            self,
+            Self::MarketOnClose
+                | Self::LimitOnClose
+                | Self::MarketWithProtection
+                | Self::StopWithProtection
+        )
     }
 
     /// Converts a Nautilus order type and time-in-force pair to the IB order type.
@@ -422,6 +456,111 @@ impl FromStr for IbOrderType {
             "REL + MKT" => Ok(Self::RelativeMarketCombo),
             _ => anyhow::bail!("Unknown IB order type: {value}"),
         }
+    }
+}
+
+/// The IBKR wire value IBKR uses for the base order type of an Adaptive algo
+/// order.
+///
+/// `IBALGO` is deliberately not an [`IbOrderType`] variant: it identifies the
+/// algo wrapper, not the base order type, so it carries no base-type
+/// information of its own. See [`classify_ib_order_type`].
+pub const IBALGO_WIRE: &str = "IBALGO";
+
+/// Classification of an inbound IBKR order-type wire value (CWR-01B).
+///
+/// The variants keep the classes a consumer must be able to distinguish
+/// separate, so no inbound path has to substitute a canonical type it cannot
+/// justify:
+///
+/// * [`Self::Exact`] — recognized and truthfully representable;
+/// * [`Self::Partial`] — recognized, truthfully representable, but an
+///   IBKR-specific attribute is lost, so the raw wire identifier must be
+///   preserved alongside the canonical value;
+/// * [`Self::Unsupported`] — recognized IBKR type with no truthful Nautilus
+///   counterpart (or an Adaptive algo order whose base type cannot be
+///   recovered);
+/// * [`Self::Unknown`] — not part of the recognized IBKR vocabulary;
+/// * [`Self::Malformed`] — empty or whitespace-only wire value.
+///
+/// [`Self::Unsupported`], [`Self::Unknown`] and [`Self::Malformed`] must be
+/// refused by callers; they never justify a canonical claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IbOrderTypeClass {
+    /// A recognized IBKR type whose canonical mapping is exact.
+    Exact(NautilusOrderType),
+    /// A recognized IBKR type whose canonical mapping is truthful but loses an
+    /// IBKR-specific attribute.
+    Partial(NautilusOrderType),
+    /// A recognized IBKR type with no truthful canonical counterpart.
+    Unsupported,
+    /// A wire value outside the recognized IBKR order-type vocabulary.
+    Unknown,
+    /// An empty or whitespace-only wire value.
+    Malformed,
+}
+
+impl IbOrderTypeClass {
+    /// Returns the truthful canonical order type, when one exists.
+    #[must_use]
+    pub const fn canonical(self) -> Option<NautilusOrderType> {
+        match self {
+            Self::Exact(order_type) | Self::Partial(order_type) => Some(order_type),
+            Self::Unsupported | Self::Unknown | Self::Malformed => None,
+        }
+    }
+
+    /// Returns a stable label naming the class, for observable outcomes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact(_) => "exact",
+            Self::Partial(_) => "partial",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// Classifies an inbound IBKR order-type wire value.
+///
+/// `limit_price` is the order's limit price, which is the only additional
+/// evidence IBKR's `IBALGO` Adaptive-algo marker offers: an Adaptive order
+/// carrying a usable limit price is classified as a partially representable
+/// limit order (upstream fix #4830 preserved), while an `IBALGO` order without
+/// one has no recoverable base type and is classified as unsupported rather
+/// than being reported as a market order (CWR-01B D1).
+///
+/// The wire value is compared byte-for-byte after the client's transport-level
+/// decoding: no case folding, trimming or alias rewriting is applied, so the
+/// caller can preserve the exact identifier. The recognition aliases
+/// (`PEGMID`, `PEGBENCH`, `PEGBEST`) are recognized here but do not change the
+/// raw string.
+#[must_use]
+pub fn classify_ib_order_type(wire: &str, limit_price: Option<f64>) -> IbOrderTypeClass {
+    if wire.trim().is_empty() {
+        return IbOrderTypeClass::Malformed;
+    }
+
+    if wire == IBALGO_WIRE {
+        return match limit_price {
+            Some(price) if crate::common::parse::is_usable_ib_price(price) => {
+                IbOrderTypeClass::Partial(NautilusOrderType::Limit)
+            }
+            _ => IbOrderTypeClass::Unsupported,
+        };
+    }
+
+    match IbOrderType::from_str(wire) {
+        Ok(order_type) => match order_type.nautilus_order_type() {
+            Some(canonical) if order_type.has_exact_canonical_projection() => {
+                IbOrderTypeClass::Exact(canonical)
+            }
+            Some(canonical) => IbOrderTypeClass::Partial(canonical),
+            None => IbOrderTypeClass::Unsupported,
+        },
+        Err(_) => IbOrderTypeClass::Unknown,
     }
 }
 
