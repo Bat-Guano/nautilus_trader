@@ -212,6 +212,7 @@ mod tests {
             limit_offset: Some(Decimal::from_str("0.123456789123456789").unwrap()),
             trailing_offset: Some(Decimal::from_str("0.987654321987654321").unwrap()),
             avg_px: Some(Decimal::from_str("1.23456789123456789").unwrap()),
+            raw_order_type: None,
             ..report
         };
 

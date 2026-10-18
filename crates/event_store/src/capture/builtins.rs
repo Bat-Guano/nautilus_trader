@@ -2708,6 +2708,7 @@ mod tests {
         let order_b = OrderStatusReport {
             client_order_id: Some(ClientOrderId::from("O-B")),
             venue_order_id: VenueOrderId::from("V-B"),
+            raw_order_type: None,
             ..make_order_status_report()
         };
         let fill_c = FillReport {

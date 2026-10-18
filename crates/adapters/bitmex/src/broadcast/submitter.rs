@@ -1007,6 +1007,7 @@ mod tests {
             cancel_reason: None,
             ts_triggered: None,
             raw_order_status: None,
+            raw_order_type: None,
         }
     }
 
